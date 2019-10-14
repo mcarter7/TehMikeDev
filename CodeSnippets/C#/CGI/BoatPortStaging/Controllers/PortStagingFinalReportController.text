@@ -1,0 +1,1424 @@
+Imports System.Web.Mvc
+Imports IPrime.Services
+Imports IPrime.Web.Reporting
+Imports System.IO
+Imports IPrime.Repository
+Imports IPrime.Infrastructure
+
+Namespace Controllers
+    Public Class PortStagingFinalReportController
+        Inherits Controller
+
+        Private ReadOnly mInventoryService As InventoryComponent = Nothing
+        Private ReadOnly mAccountService As AccountComponent = Nothing
+        Private ReadOnly mStageValidationService As StagingValidationComponent = Nothing
+        Private ReadOnly mSecurityService As ISecurityRepo = Nothing
+
+        Const staged = "STAGED"
+        Const notStaged = "NOT STAGED"
+        Const stagedSinceLastInventory = "STAGED SINCE LAST INVENTORY"
+        Const removedSinceLastInventory = "REMOVED SINCE LAST INVENTORY"
+
+        Public Sub New()
+            mInventoryService = IoC.Resolve(Of InventoryComponent)()
+            mAccountService = IoC.Resolve(Of AccountComponent)()
+            mStageValidationService = IoC.Resolve(Of StagingValidationComponent)()
+            mSecurityService = IoC.Resolve(Of ISecurityRepo)()
+        End Sub
+
+        ' GET: PortStagingFinalReport
+        Function Index() As ActionResult
+            Dim model As New PortStagingFinalReportModel
+            Dim planInventoryList As New List(Of SelectListItem)
+
+            Dim inventories = mStageValidationService.GetAllActivePortStagingPlanInventories()
+
+            If inventories IsNot Nothing Then
+                If inventories.Count = 0 Then
+                    model.NoInventoriesToCompare = True
+                End If
+            Else
+                model.NoInventoriesToCompare = True
+            End If
+
+            If Not model.NoInventoriesToCompare Then
+                For Each plan In inventories.OrderByDescending(Function(f) f.DateCreated)
+                    Dim psi As New SelectListItem
+                    psi.Text = plan.Name
+                    psi.Value = plan.InventoryId.ToString + ":" + plan.DateCreated
+                    planInventoryList.Add(psi)
+                Next
+            End If
+
+            model.StagingInventoryDropBoxA = planInventoryList
+            model.StagingInventoryDropBoxB = planInventoryList
+
+            Return View("Index", model)
+        End Function
+
+        <ActionName("CompareBtnClick")>
+        Function CompareBtnClick(dropBoxValueA As String, dropBoxValueB As String) As ActionResult
+            Dim model As New PortStagingFinalReportModel
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+            Dim endIndex = dropBoxValueA.IndexOf(":")
+            model.SelectedInventoryIdA = Guid.Parse(dropBoxValueA.Substring(0, endIndex))
+            model.SelectedInventoryIdB = Guid.Parse(dropBoxValueB.Substring(0, endIndex))
+
+            TempData.Clear()
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemA IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            'Staged since last pacman; LOLO Staged or SQLD Staging?
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                     .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                     .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                     .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            ElseIf loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                     .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                     .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                     .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+
+                    'Removed Items~ IsFound: Yes -> IsFound: No
+                    If Item.IsFound Then
+                        If Not comparisonItem.IsFound Then
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                         .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                         .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                         .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            ElseIf loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                         .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                         .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                         .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                Else
+                    'Removed Item
+                    If Item.IsFound Then
+                        'Removed since last pacman; LOLO Staged or SQLD Staging?
+                        If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                            model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        ElseIf loadSequenceNumber > 1000 Then
+                            model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In inventoryItemsB
+                Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemB IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                'LOLO Staged or SQLD Staging; Final Staged Or Not Staged
+                If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                    If Item.IsFound Then
+                        Dim checkStagedSinceLastPacman = model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                     f.Serial = Item.SerialNumber)
+
+                        If checkStagedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsLoloStaged.Inventory_FinalStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                         .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                         .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                         .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    Else
+                        model.InventoryItemsLoloStaged.Inventory_NotStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                    End If
+                ElseIf loadSequenceNumber > 1000 Then
+                    If Item.IsFound Then
+                        Dim checkStagedSinceLastPacman = model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                     f.Serial = Item.SerialNumber)
+
+                        If checkStagedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsSqldStaging.Inventory_FinalStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                         .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                         .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                         .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    Else
+                        model.InventoryItemsSqldStaging.Inventory_NotStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                    End If
+                End If
+            Next
+
+            model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = model.InventoryItemsLoloStaged.Inventory_FinalStaged.Count + model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.Count
+            model.InventoryItemsLoloStaged.Inventory_NotStagedCount = model.InventoryItemsLoloStaged.Inventory_NotStaged.Count
+            model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.Count
+            model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Count
+            model.InventoryItemsLoloStaged.Inventory_TotalCount = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount + model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+
+            model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = model.InventoryItemsSqldStaging.Inventory_FinalStaged.Count + model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.Count
+            model.InventoryItemsSqldStaging.Inventory_NotStagedCount = model.InventoryItemsSqldStaging.Inventory_NotStaged.Count
+            model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.Count
+            model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Count
+            model.InventoryItemsSqldStaging.Inventory_TotalCount = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount + model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+
+            model.ShowReport = True
+            Return View("Index", model)
+        End Function
+
+        <ActionName("BackToList")>
+        Function BackToList(model As PortStagingFinalReportModel) As ActionResult
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            model.ShowReport = True
+            Return View("Index", model)
+        End Function
+
+        <ActionName("BigPieStagedLOLO")>
+        Function BigPieStagedLOLO(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = staged
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemA IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            'Staged since last pacman; LOLO Staged or SQLD Staging?
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                     .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                     .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                     .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In inventoryItemsB
+                Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemB IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                    If Item.IsFound Then
+                        Dim checkStagedSinceLastPacman = model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                     f.Serial = Item.SerialNumber)
+
+                        If checkStagedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsLoloStaged.Inventory_FinalStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                         .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                         .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                         .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    End If
+                End If
+            Next
+
+            'Add 'Staged since last pacman' items to the 'Final Stage' list
+            model.InventoryItemsLoloStaged.Inventory_FinalStaged.AddRange(model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman)
+
+            For Each Item In model.InventoryItemsLoloStaged.Inventory_FinalStaged.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+
+            Return View("BigPieLOLO", model)
+        End Function
+
+        <ActionName("BigPieNotStagedLOLO")>
+        Function BigPieNotStagedLOLO(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = notStaged
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsB
+                Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemB IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                'LOLO Staged or SQLD Staging
+                If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                    If Not Item.IsFound Then
+                        model.InventoryItemsLoloStaged.Inventory_NotStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                    End If
+                End If
+            Next
+
+            For Each Item In model.InventoryItemsLoloStaged.Inventory_NotStaged.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieLOLO", model)
+        End Function
+
+        <ActionName("BigPieStagedSinceLastPacmanLOLO")>
+        Function BigPieStagedSinceLastPacmanLOLO(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = stagedSinceLastInventory
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemA IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            'Staged since last pacman; LOLO Staged or SQLD Staging?
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                     .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                     .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                     .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieLOLO", model)
+        End Function
+
+        <ActionName("BigPieRemovedLOLO")>
+        Function BigPieRemovedLOLO(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = removedSinceLastInventory
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Removed Items~ IsFound: Yes -> IsFound: No
+                    If Item.IsFound Then
+                        If Not comparisonItem.IsFound Then
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                         .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                         .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                         .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                Else
+                    Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                    If foundPortStageItemA IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Removed Item
+                    If Item.IsFound Then
+                        'Removed since last pacman
+                        If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                            model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieLOLO", model)
+        End Function
+
+        <ActionName("BigPieStagedSQLD")>
+        Function BigPieStagedSQLD(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = staged
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemA IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            'Staged since last pacman; LOLO Staged or SQLD Staging?
+                            If loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                     .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                     .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                     .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In inventoryItemsB
+                Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemB IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If loadSequenceNumber > 1000 Then
+                    If Item.IsFound Then
+                        Dim checkStagedSinceLastPacman = model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                     f.Serial = Item.SerialNumber)
+
+                        If checkStagedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsSqldStaging.Inventory_FinalStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                         .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                         .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                         .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    End If
+                End If
+            Next
+
+            'Add 'Staged since last pacman' items to the 'Final Stage' list
+            model.InventoryItemsSqldStaging.Inventory_FinalStaged.AddRange(model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman)
+
+            For Each Item In model.InventoryItemsSqldStaging.Inventory_FinalStaged.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieSQLD", model)
+        End Function
+
+        <ActionName("BigPieNotStagedSQLD")>
+        Function BigPieNotStagedSQLD(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = notStaged
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsB
+                Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemB IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                'LOLO Staged or SQLD Staging
+                If loadSequenceNumber > 1000 Then
+                    If Not Item.IsFound Then
+                        model.InventoryItemsSqldStaging.Inventory_NotStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                    End If
+                End If
+            Next
+
+            For Each Item In model.InventoryItemsSqldStaging.Inventory_NotStaged.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieSQLD", model)
+        End Function
+
+        <ActionName("BigPieStagedSinceLastPacmanSQLD")>
+        Function BigPieStagedSinceLastPacmanSQLD(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = stagedSinceLastInventory
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemA IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            'Staged since last pacman; LOLO Staged or SQLD Staging?
+                            If loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                     .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                     .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                     .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieSQLD", model)
+        End Function
+
+        <ActionName("BigPieRemovedSQLD")>
+        Function BigPieRemovedSQLD(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            model.CurrentStageSelectionHeader = removedSinceLastInventory
+
+            If TempData("InA") = Nothing OrElse TempData("InB") = Nothing Then
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Else
+                model.SelectedInventoryIdA = TempData("InA")
+                model.SelectedInventoryIdB = TempData("InB")
+                model.InventoryItemsLoloStaged.Inventory_FinalStagedCount = TempData("LoloFinalStageCount")
+                model.InventoryItemsLoloStaged.Inventory_NotStagedCount = TempData("LoloNotStageCount")
+                model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount = TempData("LoloStageSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount = TempData("LoloRemoveSinceLastPacman")
+                model.InventoryItemsLoloStaged.Inventory_TotalCount = TempData("LoloTotalCount")
+                model.InventoryItemsSqldStaging.Inventory_FinalStagedCount = TempData("SqldFinalStageCount")
+                model.InventoryItemsSqldStaging.Inventory_NotStagedCount = TempData("SqldNotStageCount")
+                model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount = TempData("SqldStageSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount = TempData("SqldRemoveSinceLastPacman")
+                model.InventoryItemsSqldStaging.Inventory_TotalCount = TempData("SqldTotalCount")
+                TempData("InA") = model.SelectedInventoryIdA
+                TempData("InB") = model.SelectedInventoryIdB
+                TempData("LoloFinalStageCount") = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+                TempData("LoloNotStageCount") = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+                TempData("LoloStageSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+                TempData("LoloRemoveSinceLastPacman") = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+                TempData("LoloTotalCount") = model.InventoryItemsLoloStaged.Inventory_TotalCount
+                TempData("SqldFinalStageCount") = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+                TempData("SqldNotStageCount") = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+                TempData("SqldStageSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+                TempData("SqldRemoveSinceLastPacman") = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+                TempData("SqldTotalCount") = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            End If
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Removed Items~ IsFound: Yes -> IsFound: No
+                    If Item.IsFound Then
+                        If Not comparisonItem.IsFound Then
+                            If loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                         .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                         .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                         .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber})
+                            End If
+                        End If
+                    End If
+                Else
+                    Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                    If foundPortStageItemA IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Removed Item
+                    If Item.IsFound Then
+                        'Removed since last pacman
+                        If loadSequenceNumber > 1000 Then
+                            model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                     .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                     .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                     .Modified = Item.Modified, .PRI = loadSequenceNumber})
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.OrderBy(Function(f) f.PRI)
+                model.ReportItems.Add(New StagingFinalReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                             .SerialNumber = Item.Serial, .Nomen = Item.Nomen,
+                                                                             .Location = Item.Location, .IsFound = Item.Found,
+                                                                             .Modified = Item.Modified, .PRI = Item.PRI})
+            Next
+            Return View("BigPieSQLD", model)
+        End Function
+
+        <ActionName("ExportExcelMethod")>
+        Function ExportExcelMethod(model As PortStagingFinalReportModel) As ActionResult
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim loadSequenceNumber = 0
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlanA = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItemsA = mStageValidationService.GetSelectedPortStage(portStagingPlanA.PlanId)
+
+            Dim portStagingPlanB = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdB)
+            Dim portStagingPlanItemsB = mStageValidationService.GetSelectedPortStage(portStagingPlanB.PlanId)
+            model.InventoryName = portStagingPlanB.Name
+
+            For Each Item In portStagingPlanItemsA
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+            For Each Item In portStagingPlanItemsB
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If comparisonItem IsNot Nothing Then
+                    Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = comparisonItem.NSN AndAlso f.SerialNumber = comparisonItem.SerialNumber)
+
+                    If foundPortStageItemB IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            'Staged since last pacman; LOLO Staged or SQLD Staging?
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                        .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                        .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                        .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber, .StagedSinceLastPacman = True})
+                            ElseIf loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                        .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                        .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                        .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber, .StagedSinceLastPacman = True})
+                            End If
+                        End If
+                    End If
+
+                    'Removed Items~ IsFound: Yes -> IsFound: No
+                    If Item.IsFound Then
+                        If Not comparisonItem.IsFound Then
+                            If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                                model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                         .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                         .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                         .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber, .RemovedSinceLastPacman = True})
+                            ElseIf loadSequenceNumber > 1000 Then
+                                model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = comparisonItem.ItemId, .NSN = comparisonItem.NSN,
+                                                                                                                         .Serial = comparisonItem.SerialNumber, .Nomen = comparisonItem.Nomen,
+                                                                                                                         .Location = comparisonItem.LocationName, .Found = comparisonItem.IsFound,
+                                                                                                                         .Modified = comparisonItem.Modified, .PRI = loadSequenceNumber, .RemovedSinceLastPacman = True})
+                            End If
+                        End If
+                    End If
+                Else
+                    Dim foundPortStageItemA = portStagingPlanItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                    If foundPortStageItemA IsNot Nothing Then
+                        loadSequenceNumber = foundPortStageItemA.LoadSequenceNumber
+                    Else
+                        loadSequenceNumber = 0
+                    End If
+
+                    'Removed Item
+                    If Item.IsFound Then
+                        'Removed since last pacman; LOLO Staged or SQLD Staging?
+                        If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                            model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                        .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                        .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                        .Modified = Item.Modified, .PRI = loadSequenceNumber, .RemovedSinceLastPacman = True})
+                        ElseIf loadSequenceNumber > 1000 Then
+                            model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                        .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                        .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                        .Modified = Item.Modified, .PRI = loadSequenceNumber, .RemovedSinceLastPacman = True})
+                        End If
+                    End If
+                End If
+            Next
+
+            For Each Item In inventoryItemsB
+                Dim foundPortStageItemB = portStagingPlanItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+
+                If foundPortStageItemB IsNot Nothing Then
+                    loadSequenceNumber = foundPortStageItemB.LoadSequenceNumber
+                Else
+                    loadSequenceNumber = 0
+                End If
+
+                'LOLO Staged or SQLD Staging; Final Staged Or Not Staged
+                If loadSequenceNumber >= 1 AndAlso loadSequenceNumber < 1000 Then
+                    If Item.IsFound Then
+                        Dim checkStagedSinceLastPacman = model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                        f.Serial = Item.SerialNumber)
+
+                        If checkStagedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsLoloStaged.Inventory_FinalStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                            .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                            .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                            .Modified = Item.Modified, .PRI = loadSequenceNumber, .FinalStaged = True})
+                        End If
+                    Else
+                        Dim checkRemovedSinceLastPacman = model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                     f.Serial = Item.SerialNumber)
+
+                        If checkRemovedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsLoloStaged.Inventory_NotStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                            .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                            .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                            .Modified = Item.Modified, .PRI = loadSequenceNumber, .NotStaged = True})
+                        End If
+                    End If
+                ElseIf loadSequenceNumber > 1000 Then
+                    If Item.IsFound Then
+                        Dim checkStagedSinceLastPacman = model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                        f.Serial = Item.SerialNumber)
+
+                        If checkStagedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsSqldStaging.Inventory_FinalStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                            .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                            .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                            .Modified = Item.Modified, .PRI = loadSequenceNumber, .FinalStaged = True})
+                        End If
+                    Else
+                        Dim checkRemovedSinceLastPacman = model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso
+                                                                                                                                                     f.Serial = Item.SerialNumber)
+
+                        If checkRemovedSinceLastPacman Is Nothing Then
+                            model.InventoryItemsSqldStaging.Inventory_NotStaged.Add(New Reporting.StagingReportItems With {.ItemId = Item.ItemId, .NSN = Item.NSN,
+                                                                                                                            .Serial = Item.SerialNumber, .Nomen = Item.Nomen,
+                                                                                                                            .Location = Item.LocationName, .Found = Item.IsFound,
+                                                                                                                            .Modified = Item.Modified, .PRI = loadSequenceNumber, .NotStaged = True})
+                        End If
+                    End If
+                End If
+            Next
+
+            Return ExcelExport(model)
+        End Function
+
+        Public Function ExcelExport(model As PortStagingFinalReportModel)
+            Dim filename As String = "Port_Staging_Final_Report_" & Date.UtcNow.ToString("yyyyMMdd_HHmmss") & ".xlsx"
+            Dim loloStagedItems As New List(Of Reporting.StagingReportItems)
+            Dim sqldStagingItems As New List(Of Reporting.StagingReportItems)
+            Dim stagingTotals As New StagingTotals
+            Dim reportLoloTitle = model.InventoryName + " LOLO STAGED REPORT                                                                                "
+            Dim reportSqldTitle = model.InventoryName + " SQLD STAGING REPORT                                                                               "
+            Dim plannedLoloQty = model.InventoryItemsLoloStaged.Inventory_TotalCount
+            Dim plannedRoroQty = model.InventoryItemsSqldStaging.Inventory_TotalCount
+            Dim timeStamped = DateTime.Now.ToUniversalTime
+            Dim row = 1
+
+            Dim currentUserId = IPrimePrincipal.Current.UserId
+            Dim lastModifiedBy = mSecurityService.FetchUser(currentUserId).Username
+
+            stagingTotals.FinalStagedLoloCount = model.InventoryItemsLoloStaged.Inventory_FinalStagedCount
+            stagingTotals.NotStagedLoloCount = model.InventoryItemsLoloStaged.Inventory_NotStagedCount
+            stagingTotals.RemovedSinceLastPacmanLoloCount = model.InventoryItemsLoloStaged.Inventory_RemovedSinceLastPacmanCount
+            stagingTotals.StagedSinceLastPacmanLoloCount = model.InventoryItemsLoloStaged.Inventory_StagedSinceLastPacmanCount
+            stagingTotals.FinalStagedSqldCount = model.InventoryItemsSqldStaging.Inventory_FinalStagedCount
+            stagingTotals.NotStagedSqldCount = model.InventoryItemsSqldStaging.Inventory_NotStagedCount
+            stagingTotals.RemovedSinceLastPacmanSqldCount = model.InventoryItemsSqldStaging.Inventory_RemovedSinceLastPacmanCount
+            stagingTotals.StagedSinceLastPacmanSqldCount = model.InventoryItemsSqldStaging.Inventory_StagedSinceLastPacmanCount
+
+            loloStagedItems.AddRange(model.InventoryItemsLoloStaged.Inventory_FinalStaged)
+            loloStagedItems.AddRange(model.InventoryItemsLoloStaged.Inventory_NotStaged)
+            loloStagedItems.AddRange(model.InventoryItemsLoloStaged.InventoryComparison_StagedSinceLastPacman)
+            loloStagedItems.AddRange(model.InventoryItemsLoloStaged.InventoryComparison_RemovedSinceLastPacman)
+            loloStagedItems = loloStagedItems.OrderBy(Function(f) f.PRI).ToList
+
+            For Each Item In loloStagedItems
+                Item.RowCount = row
+                row += 1
+            Next
+
+            sqldStagingItems.AddRange(model.InventoryItemsSqldStaging.Inventory_FinalStaged)
+            sqldStagingItems.AddRange(model.InventoryItemsSqldStaging.Inventory_NotStaged)
+            sqldStagingItems.AddRange(model.InventoryItemsSqldStaging.InventoryComparison_StagedSinceLastPacman)
+            sqldStagingItems.AddRange(model.InventoryItemsSqldStaging.InventoryComparison_RemovedSinceLastPacman)
+            sqldStagingItems = sqldStagingItems.OrderBy(Function(f) f.PRI).ToList
+
+            row = 1
+            For Each Item In sqldStagingItems
+                Item.RowCount = row
+                row += 1
+            Next
+
+            Using ms As New MemoryStream
+                Dim package As New Reporting.PortStagingExport
+                package.CreatePackage(ms, sqldStagingItems, loloStagedItems, reportSqldTitle, reportLoloTitle, plannedRoroQty, plannedLoloQty, stagingTotals, timeStamped, lastModifiedBy)
+
+                Return New ExcelExport_PortStageFinalValidation(ms.ToArray(), filename)
+            End Using
+        End Function
+
+        Public Class ExcelExport_PortStageFinalValidation
+            Inherits FileStreamResult
+
+            Private Const ExcelMimeType = "application/vnd.ms-excel"
+
+            Public Sub New(resultBytes As Byte(), filename As String)
+                MyBase.New(New MemoryStream(resultBytes), ExcelMimeType)
+                FileDownloadName = filename
+            End Sub
+
+        End Class
+
+    End Class
+End Namespace

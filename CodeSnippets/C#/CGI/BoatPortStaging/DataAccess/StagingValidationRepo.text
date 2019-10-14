@@ -1,0 +1,605 @@
+Imports iAnywhere.Data.SQLAnywhere
+Imports Oracle.ManagedDataAccess.Client
+Imports System.Text
+Imports IPrime.StageValidation
+
+Public NotInheritable Class StagingValidationRepo
+    Implements IStagingValidationRepo
+
+    Public Sub New()
+    End Sub
+
+#Region "FetchMDSSPlan"
+
+    Private Shared ReadOnly FetchMDSSPlanItemsSql = <sql>
+SELECT
+     PLAN_ID
+    ,UIC
+    ,NSN
+    ,ITEM_ID
+    ,DESCRIPTION
+    ,load_number
+    ,WEIGHT_LB
+    ,ASSOCIATION
+    ,PKG_ID
+    ,LENGTH_IN
+    ,HEIGHT_IN
+    ,WIDTH_IN
+    ,PARENT_PKG_NSN
+FROM
+    "logais"."UDL"
+WHERE
+    PLAN_ID = ?
+AND
+    (ASSOCIATION IS null
+OR
+    ASSOCIATION = 'Hitched')
+
+                                               </sql>.Value
+
+    ''' <summary>
+    ''' Fetch a MDSSII plan by its ID.
+    ''' </summary>
+    ''' <param name="planId">The ID of the account.</param>
+    ''' <returns>The plan if it exists otherwise nothing.</returns>
+    ''' <remarks></remarks>
+    Public Function FetchMDSSPlanItems(planId As Integer) As IEnumerable(Of StageItem) Implements IStagingValidationRepo.FetchMDSSPlanItems
+        Dim db As New SAConnection(DatabaseFactory.ISybaseConnectionString)
+        db.Open()
+
+        Dim results As New List(Of StageItem)
+
+        Using cmd As New SACommand(FetchMDSSPlanItemsSql)
+            cmd.Connection = db
+            cmd.Parameters.AddWithValue("@PlanId", planId)
+
+            Using rdr = cmd.ExecuteReader
+                While rdr.Read
+                    Dim item As New StageItem() With {.MdssPlanId = Integer.Parse(rdr.GetValue(0)),
+                                                     .UIC = rdr.GetValue(1).ToString(),
+                                                     .NSN = rdr.GetValue(2).ToString(),
+                                                     .ItemId = rdr.GetValue(3).ToString(),
+                                                     .Nomen = rdr.GetValue(4).ToString(),
+                                                     .LoadNumber = rdr.GetValue(5).ToString(),
+                                                     .WeightLbs = rdr.GetValue(6).ToString(),
+                                                     .Association = rdr.GetValue(7).ToString(),
+                                                     .SerialNumber = rdr.GetValue(8).ToString(),
+                                                     .LengthInches = rdr.GetValue(9).ToString(),
+                                                     .HeightInches = rdr.GetValue(10).ToString(),
+                                                     .WidthInches = rdr.GetValue(11).ToString(),
+                                                     .ParentPkgNSN = rdr.GetValue(12).ToString()}
+                    results.Add(item)
+                End While
+
+                db.Close()
+                Return results
+            End Using
+        End Using
+    End Function
+
+#End Region
+
+#Region "Fetch Load Sequence Number"
+
+    Public Function FetchLoadSequenceNumbersForItems(pid As String, items As IEnumerable(Of StageItem)) As StageValidataionItem() Implements IStagingValidationRepo.FetchLoadSequenceNumbersForItems
+        Dim results As New List(Of StageValidataionItem)
+        Dim sql = New StringBuilder()
+
+        For Each item In items
+            If (sql.Length = 0) Then
+                sql.AppendLine("SELECT A.NSN, A.SN, B.SEQ_NUMBER, B.PRIORITY")
+                sql.AppendLine(String.Format("  FROM (SELECT '{0}' AS NSN, '{1}' AS SN FROM DUAL", item.NSN, item.SerialNumber))
+                Continue For
+            End If
+
+            sql.AppendLine(String.Format("        UNION SELECT '{0}' AS NSN, '{1}' AS SN FROM DUAL", item.NSN, item.SerialNumber))
+        Next
+
+        sql.AppendLine("        ) A")
+        sql.AppendLine(String.Format(<![CDATA[  LEFT JOIN (SELECT C.SEQUENCENUMBER AS SEQ_NUMBER, C.ONLOADPRIORITY AS PRIORITY, C.NSN, C.PACKAGEID AS SN
+        FROM SLP_CARGOLIST A
+        JOIN SLP_LOADPLAN B
+          ON A.LODPLN_CAGLIT_PID = B.PID
+        JOIN SLP_CARGO C
+          ON A.PID = C.CAGLIT_CAG_PID
+       WHERE B.PID = '{0}') B
+    ON A.NSN = B.NSN
+
+   AND A.SN = B.SN]]>.Value, pid))
+
+        Using conn As New OracleConnection(DatabaseFactory.OracleConnectionString)
+            Using cmd As New OracleCommand(sql.ToString(), conn)
+                conn.Open()
+
+                Using rdr = cmd.ExecuteReader()
+                    While rdr.Read
+                        Dim nsn = rdr.GetString(0)
+                        Dim sn = rdr.GetString(1)
+                        Dim seqNumber As Integer? = If(rdr.IsDBNull(2), Nothing, rdr.GetInt32(2))
+                        Dim priority As Integer? = If(rdr.IsDBNull(3), Nothing, rdr.GetInt32(3))
+
+                        results.Add(New StageValidataionItem(nsn, sn, seqNumber, priority))
+                    End While
+                End Using
+            End Using
+        End Using
+
+        Return results.ToArray()
+    End Function
+
+#End Region
+
+#Region "Get All Plan ID's from MDSSII"
+    Private Shared ReadOnly GetDistinctPlanId = <sql>
+SELECT DISTINCT
+UDL.PLAN_ID,
+PL.NAME
+FROM
+ "logais"."UDL" as UDL
+INNER JOIN "logais"."PLAN" AS PL ON UDL.PLAN_ID = PL.PLAN_ID
+
+</sql>.Value
+
+    Public Function GetAllPlans() As IDictionary(Of String, String) Implements IStagingValidationRepo.GetAllPlans
+        Dim planList As Dictionary(Of String, String) = New Dictionary(Of String, String)
+
+        Dim db = DatabaseFactory.CreateSybaseConnection
+        Using cmd = db.GetSqlStringCommand(GetDistinctPlanId)
+            Using rdr = db.ExecuteReader(cmd)
+                While rdr.Read
+                    Dim key = rdr.GetString(0)
+                    Dim value = rdr.GetString(1)
+                    planList.Add(key, value)
+                End While
+            End Using
+        End Using
+
+        Return planList
+    End Function
+#End Region
+
+#Region "Get All ICODES Load Plans"
+    Private Shared ReadOnly GetIcodesLoadPlansSql = <sql>
+Select Distinct 
+PID,
+Name
+FROM
+SLP_LOADPLAN
+Where DELETED = 0
+                                                    </sql>.Value
+
+    Public Function GetAllIcodesLoadPlans() As IDictionary(Of String, String) Implements IStagingValidationRepo.GetAllIcodesLoadPlans
+        Dim loadPlans As Dictionary(Of String, String) = New Dictionary(Of String, String)
+
+        Using conn As New OracleConnection(DatabaseFactory.OracleConnectionString)
+            Using cmd As New OracleCommand(GetIcodesLoadPlansSql.ToString(), conn)
+                conn.Open()
+
+                Using rdr = cmd.ExecuteReader()
+                    While rdr.Read
+                        Dim key = rdr.GetString(0)
+                        Dim value = rdr.GetString(1)
+                        loadPlans.Add(key, value)
+                    End While
+                End Using
+            End Using
+        End Using
+
+        Return loadPlans
+    End Function
+
+#End Region
+
+#Region "Get All Port Staging Plans"
+
+    Private Shared ReadOnly GetPlansSql = <sql>
+SELECT DISTINCT
+PlanId,
+Name
+FROM
+PortStagingPlan
+Where AccountId = @AccountId
+
+</sql>.Value
+
+    Public Function GetAllPortStagingPlans(ByVal accountId As Guid) As IDictionary(Of String, String) Implements IStagingValidationRepo.GetAllPortStagingPlans
+        Dim planList As Dictionary(Of String, String) = New Dictionary(Of String, String)
+
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(GetPlansSql)
+            db.AddInParameter(cmd, "AccountId", DbType.Guid, accountId)
+            Using rdr = db.ExecuteReader(cmd)
+                While rdr.Read
+                    Dim key = rdr.GetGuid(0).ToString
+                    Dim value = rdr.GetString(1)
+                    planList.Add(key, value)
+                End While
+            End Using
+        End Using
+
+        Return planList
+    End Function
+
+#End Region
+
+#Region "Get Selected Port Stage Plan"
+
+    Private Shared ReadOnly GetSelectedPortStageItemsSql = <sql>
+SELECT PlanItemId
+,I.PlanId AS PortStagePlanId
+,P.MDSSII_PlanId AS MdssPlanId
+,P.ICODES_PlanId as IcodesPlanId
+,UIC
+,Nomen
+,ItemId
+,NSN
+,SerialNumber
+,ModelNumber
+,LoadNumber
+,Association
+,WeightLbs
+,WidthInches
+,HeightInches
+,LengthInches
+,OnLoadPriority
+,SequenceNumber
+,LoadSequenceNumber
+FROM
+PortStagingItem I
+INNER JOIN PortStagingPlan P
+  ON I.PlanId = P.PlanId
+Where I.PlanId = @PlanId
+
+</sql>.Value
+
+    Public Function GetSelectedPortStage(planId As Guid) As IEnumerable(Of StageItem) Implements IStagingValidationRepo.GetSelectedPortStage
+        Dim results As New List(Of StageItem)
+
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(GetSelectedPortStageItemsSql)
+            db.AddInParameter(cmd, "PlanId", DbType.Guid, planId)
+            results = db.FillEnumerable(Of StageItem)(cmd)
+        End Using
+
+        Return results
+    End Function
+
+#End Region
+
+#Region "Get Single Port Plan"
+
+    Private Shared ReadOnly GetSinglePortPlanSql = <sql>
+SELECT PlanId
+,Name
+,Account
+,AccountId
+,Custodian
+,CustodianId
+,EDayDate
+FROM PortStagingPlan P
+Where P.PlanId = @PlanId
+
+</sql>.Value
+
+    Public Function GetSinglePortPlan(planId As Guid) As StagePlan Implements IStagingValidationRepo.GetSinglePortPlan
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(GetSinglePortPlanSql)
+            db.AddInParameter(cmd, "PlanId", DbType.Guid, planId)
+            GetSinglePortPlan = db.Fill(Of StagePlan)(cmd)
+        End Using
+    End Function
+
+#End Region
+
+#Region "Insert Port Stage Validation Plan "
+    Private Shared ReadOnly InsertPortStageValidationPlanSql As String = <![CDATA[
+IF NOT EXISTS(SELECT[PlanId]
+                   ,[Name]
+                   ,[MDSSII_PlanId]
+                   ,[ICODES_PlanId]
+                   ,[Account]
+                   ,[AccountId]
+                   ,[Custodian]
+                   ,[CustodianId]
+                   ,[EDayDate]
+            FROM   PortStagingPlan
+            WHERE  PlanId = @PlanId) 
+                BEGIN 
+                   INSERT INTO PortStagingPlan
+                   (PlanId,Name, MDSSII_PlanId,ICODES_PlanId, Account, AccountId, Custodian, CustodianId, EDayDate)
+                Values
+                   (@PlanId, @Name, @MDSSII_PlanId, @ICODES_PlanId, @Account, @AccountId, @Custodian, @CustodianId, @EDayDate)
+                END
+]]>.Value
+
+
+    Public Sub InsertPortStageValidationPlan(planId As Guid, planName As String, mdssPlanId As Integer, iCodesPlanId As Guid, account As String, accountId As Guid, custodian As String, custodianId As Guid, eDayDate As DateTime) Implements IStagingValidationRepo.InsertPortStageValidationPlan
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(InsertPortStageValidationPlanSql)
+            db.AddInParameter(cmd, "@PlanId", DbType.Guid, planId)
+            db.AddInParameter(cmd, "@Name", DbType.String, planName)
+            db.AddInParameter(cmd, "@MDSSII_PlanId", DbType.Int32, mdssPlanId)
+            db.AddInParameter(cmd, "@ICODES_PlanId", DbType.Guid, iCodesPlanId)
+            db.AddInParameter(cmd, "@Account", DbType.String, account)
+            db.AddInParameter(cmd, "@AccountId", DbType.Guid, accountId)
+            db.AddInParameter(cmd, "@Custodian", DbType.String, custodian)
+            db.AddInParameter(cmd, "@CustodianId", DbType.Guid, custodianId)
+            db.AddInParameter(cmd, "@EDayDate", DbType.DateTime, eDayDate)
+
+            db.ExecuteNonQuery(cmd)
+        End Using
+    End Sub
+#End Region
+
+#Region "Insert Port Stage Validation Plan Items"
+
+    Private Shared ReadOnly InsertPortStageValidationPlanItemsSql As String = <![CDATA[
+INSERT INTO PortStagingItem 
+    (PlanItemId, PlanId, UIC, Nomen, ItemId, NSN, SerialNumber, ModelNumber, LoadNumber, Association, WeightLbs, WidthInches, HeightInches, LengthInches, OnLoadPriority, SequenceNumber, LoadSequenceNumber)
+VALUES
+    (@PlanItemId, @PlanId, @UIC, @Nomen, @ItemId, @NSN, @SerialNumber, @ModelNumber, @LoadNumber, @Association, @WeightLbs, @WidthInches, @HeightInches, @LengthInches, @OnLoadPriority, @SequenceNumber, @LoadSequenceNumber)
+]]>.Value
+
+    Public Sub InsertPortStageValidationPlanItems(portStagePlanId As Guid, portStageValidationItems As IEnumerable(Of StageItem)) Implements IStagingValidationRepo.InsertPortStageValidationPlanItems
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(InsertPortStageValidationPlanItemsSql)
+            For Each item As StageItem In portStageValidationItems
+                cmd.Parameters.Clear()
+
+                db.AddInParameter(cmd, "@PlanItemId", DbType.Guid, Guid.NewGuid)
+                db.AddInParameter(cmd, "@PlanId", DbType.Guid, portStagePlanId)
+                db.AddInParameter(cmd, "@UIC", DbType.String, item.UIC)
+                db.AddInParameter(cmd, "@Nomen", DbType.String, item.Nomen)
+                db.AddInParameter(cmd, "@ItemId", DbType.String, item.ItemId)
+                db.AddInParameter(cmd, "@NSN", DbType.String, item.NSN)
+                db.AddInParameter(cmd, "@SerialNumber", DbType.String, item.SerialNumber)
+                db.AddInParameter(cmd, "@ModelNumber", DbType.String, item.ModelNumber)
+                db.AddInParameter(cmd, "@LoadNumber", DbType.String, item.LoadNumber)
+                db.AddInParameter(cmd, "@Association", DbType.String, item.Association)
+                db.AddInParameter(cmd, "@WeightLbs", DbType.Int32, item.WeightLbs)
+                db.AddInParameter(cmd, "@WidthInches", DbType.Int32, item.WidthInches)
+                db.AddInParameter(cmd, "@HeightInches", DbType.Int32, item.HeightInches)
+                db.AddInParameter(cmd, "@LengthInches", DbType.Int32, item.LengthInches)
+                db.AddInParameter(cmd, "@OnLoadPriority", DbType.Int32, item.OnLoadPriority)
+                db.AddInParameter(cmd, "@SequenceNumber", DbType.Int32, item.SequenceNumber)
+                db.AddInParameter(cmd, "@LoadSequenceNumber", DbType.String, item.LoadSequenceNumber)
+
+                db.ExecuteNonQuery(cmd)
+            Next
+
+        End Using
+    End Sub
+#End Region
+
+#Region "Insert Inventory Items"
+
+    Private Shared ReadOnly InsertInventoryItemsSql As String = <![CDATA[
+INSERT INTO InventoryItem 
+    (InventoryId, ItemGuid, AssetId, UII, EpcId, NSN, SerialNumber, ItemId, Nomen, LocationId, LastLocationId, LocationName, IsFound, Status, Changed, Modified, Latitude, Longitude)
+VALUES
+    (@InventoryId, @ItemGuid, @AssetId, @UII, @EpcId, @NSN, @SerialNumber, @ItemId, @Nomen, @LocationId, @LastLocationId, @LocationName, @IsFound, @Status, @Changed, @Modified, @Latitude, @Longitude)
+]]>.Value
+
+    Public Sub InsertInventoryItems(inventoryItems As IPrime.InventoryItem()) Implements IStagingValidationRepo.InsertInventoryItems
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(InsertInventoryItemsSql)
+            For Each item As IPrime.InventoryItem In inventoryItems
+                cmd.Parameters.Clear()
+
+                db.AddInParameter(cmd, "@InventoryId", DbType.Guid, item.InventoryId)
+                db.AddInParameter(cmd, "@ItemGuid", DbType.Guid, item.ItemGuid)
+                db.AddInParameter(cmd, "@AssetId", DbType.String, item.AssetId)
+                db.AddInParameter(cmd, "@UII", DbType.String, item.UII)
+                db.AddInParameter(cmd, "@EpcId", DbType.String, item.EpcId)
+                db.AddInParameter(cmd, "@NSN", DbType.String, item.NSN)
+                db.AddInParameter(cmd, "@SerialNumber", DbType.String, item.SerialNumber)
+                db.AddInParameter(cmd, "@ItemId", DbType.String, item.ItemId)
+                db.AddInParameter(cmd, "@Nomen", DbType.String, item.Nomen)
+                db.AddInParameter(cmd, "@LocationId", DbType.Guid, item.LocationId)
+                db.AddInParameter(cmd, "@LastLocationId", DbType.Guid, Guid.Empty)
+                db.AddInParameter(cmd, "@LocationName", DbType.String, item.LocationName)
+                db.AddInParameter(cmd, "@IsFound", DbType.Boolean, item.IsFound)
+                db.AddInParameter(cmd, "@Status", DbType.String, item.Status)
+                db.AddInParameter(cmd, "@Changed", DbType.DateTime, item.Changed)
+                db.AddInParameter(cmd, "@Modified", DbType.DateTime, item.Modified)
+                db.AddInParameter(cmd, "@Latitude", DbType.Double, item.Latitude)
+                db.AddInParameter(cmd, "@Longitude", DbType.Double, item.Longitude)
+
+                db.ExecuteNonQuery(cmd)
+            Next
+
+        End Using
+    End Sub
+#End Region
+
+#Region "Insert Port Stage Inventory"
+
+    Private Shared ReadOnly InsertPortStagingPlan_InventorySql As String = <![CDATA[
+  Declare @rowCount int
+  Select @rowCount = (Select count(*) FROM PortStagingPlan_Inventory) + 1
+
+  Insert Into PortStagingPlan_Inventory
+  (PlanId, InventoryId, Date, InventoryOrder)
+  Values
+  (@planId, @InventoryId, @DateCreated, @rowCount)
+]]>.Value
+
+    Public Sub InsertPortStagingPlan_Inventory(portStagePlanId As Guid, inventoryId As Guid, dateCreated As DateTime) Implements IStagingValidationRepo.InsertPortStagingPlan_Inventory
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(InsertPortStagingPlan_InventorySql)
+            db.AddInParameter(cmd, "@PlanId", DbType.Guid, portStagePlanId)
+            db.AddInParameter(cmd, "@InventoryId", DbType.Guid, inventoryId)
+            db.AddInParameter(cmd, "@DateCreated", DbType.DateTime, dateCreated)
+
+            db.ExecuteNonQuery(cmd)
+        End Using
+    End Sub
+#End Region
+
+#Region "Insert PlaybookItem with Load Sequence Number"
+
+    Private Shared ReadOnly InsertPlaybookItem_LoadSequenceSql As String = <![CDATA[
+INSERT INTO PlaybookItem_LoadSequence 
+    (PlaybookId, ItemGuid, LoadSequenceNumber, ModifiedDate, ModifiedBy)
+VALUES
+    (@PlaybookId, @ItemGuid, @LoadSequenceNumber, @ModifiedDate, @ModifiedBy)
+]]>.Value
+
+    Public Sub InsertPlaybookItem_LoadSequence(playbookId As Guid, itemGuid As Guid, loadSequenceNumber As String, modifiedBy As Guid) Implements IStagingValidationRepo.InsertPlaybookItem_LoadSequenceNumber
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(InsertPlaybookItem_LoadSequenceSql)
+            db.AddInParameter(cmd, "@PlaybookId", DbType.Guid, playbookId)
+            db.AddInParameter(cmd, "@ItemGuid", DbType.Guid, itemGuid)
+            db.AddInParameter(cmd, "@LoadSequenceNumber", DbType.String, loadSequenceNumber)
+            db.AddInParameter(cmd, "@ModifiedDate", DbType.DateTime, Date.Now)
+            db.AddInParameter(cmd, "@ModifiedBy", DbType.Guid, modifiedBy)
+
+            db.ExecuteNonQuery(cmd)
+        End Using
+    End Sub
+
+#End Region
+
+#Region "Update PlaybookItem_LoadSequence"
+
+    Private Shared ReadOnly UpdatePlaybookItem_LoadSequenceSql As String = <sql>
+UPDATE 
+    [PlaybookItem_LoadSequence]
+SET
+   [LoadSequenceNumber] = @LoadSequenceNumber
+ , [ModifiedDate] = @ModifiedDate
+, [ModifiedBy] = @ModifiedBy
+WHERE     
+    [PlaybookId] = @PlaybookId
+    AND
+    [ItemGuid] = @ItemGuid
+</sql>.Value
+
+    Public Sub UpdatePlaybookItem_LoadSequence(playbookId As Guid, itemGuid As Guid, loadSequenceNumber As String, modifiedBy As Guid) Implements IStagingValidationRepo.UpdatePlaybookItem_LoadSequence
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(UpdatePlaybookItem_LoadSequenceSql)
+            db.AddInParameter(cmd, "@PlaybookId", DbType.Guid, playbookId)
+            db.AddInParameter(cmd, "@ItemGuid", DbType.Guid, itemGuid)
+            db.AddInParameter(cmd, "@LoadSequenceNumber", DbType.String, loadSequenceNumber)
+            db.AddInParameter(cmd, "@ModifiedDate", DbType.DateTime, Date.Now)
+            db.AddInParameter(cmd, "@ModifiedBy", DbType.Guid, modifiedBy)
+
+            db.ExecuteNonQuery(cmd)
+        End Using
+    End Sub
+
+#End Region
+
+#Region "Find PlaybookItem_LoadSequence"
+
+    Private Shared ReadOnly FindPlaybookItem_LoadSequenceSql As String = <sql>
+SELECT PlaybookId
+,ItemGuid
+,LoadSequenceNumber
+,ModifiedDate
+,ModifiedBy
+FROM 
+    PlaybookItem_LoadSequence PB
+WHERE 
+    PB.PlaybookId = @PlaybookId
+    AND
+    PB.ItemGuid = @ItemGuid
+                                                                         </sql>.Value
+
+    Public Function FindPlaybookItem_LoadSequence(playbookId As Guid, itemGuid As Guid) As PlaybookSequenceItem Implements IStagingValidationRepo.FindPlaybookItem_LoadSequence
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(FindPlaybookItem_LoadSequenceSql)
+            db.AddInParameter(cmd, "PlaybookId", DbType.Guid, playbookId)
+            db.AddInParameter(cmd, "ItemGuid", DbType.Guid, itemGuid)
+            FindPlaybookItem_LoadSequence = db.Fill(Of PlaybookSequenceItem)(cmd)
+        End Using
+    End Function
+
+#End Region
+
+#Region "Get Virtual Container Nsn"
+    Private Shared ReadOnly GetAllContainersSql = <sql>
+    SELECT 
+       *
+    FROM
+        [dbo].[Billing_VirtualNSN]
+
+    </sql>.Value
+
+    Public Function GetAllContainers() As IEnumerable(Of String) Implements IStagingValidationRepo.GetAllContainers
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Dim result As New List(Of String)
+
+        Using cmd = db.GetSqlStringCommand(GetAllContainersSql)
+            Using rdr = db.ExecuteReader(cmd)
+                While rdr.Read
+                    Dim item = rdr.GetValue(0)
+
+                    result.Add(item)
+                End While
+            End Using
+        End Using
+        Return result
+    End Function
+#End Region
+
+#Region "Get All Active PortStagingPlan_Inventories"
+
+    Private Shared ReadOnly GetAllPortStagingPlan_InventorySql = <sql>
+    SELECT DISTINCT [PlanId]
+      ,P.[InventoryId]
+      ,[Date] AS DateCreated
+      ,[InventoryOrder]
+   ,I.Name
+  FROM PortStagingPlan_Inventory P
+  INNER JOIN Inventory I
+  On I.InventoryId = P.InventoryId
+  Where I.Status = 'OPENED'
+</sql>.Value
+
+    Public Function GetAllPortStagingPlan_Inventory() As IEnumerable(Of PortStagePlanInventory) Implements IStagingValidationRepo.GetAllPortStagingPlan_Inventory
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(GetAllPortStagingPlan_InventorySql)
+            GetAllPortStagingPlan_Inventory = db.FillEnumerable(Of PortStagePlanInventory)(cmd)
+        End Using
+    End Function
+
+#End Region
+
+#Region "Get Single PortStagingPlan_Inventories"
+
+    Private Shared ReadOnly GetSingleStagingPlan_InventorySql = <sql>
+    SELECT DISTINCT [PlanId]
+      ,P.[InventoryId]
+      ,[Date] AS DateCreated
+      ,[InventoryOrder]
+   ,I.Name
+  FROM PortStagingPlan_Inventory P
+  INNER JOIN Inventory I
+  On I.InventoryId = P.InventoryId
+  Where P.InventoryId = @InventoryId    
+</sql>.Value
+
+    Public Function GetSingleStagingPlan_Inventory(inventoryId As Guid) As PortStagePlanInventory Implements IStagingValidationRepo.GetSinglePortStagingPlan_Inventory
+        Dim db = DatabaseFactory.CreateIPrimeConnection
+
+        Using cmd = db.GetSqlStringCommand(GetSingleStagingPlan_InventorySql)
+            db.AddInParameter(cmd, "InventoryId", DbType.Guid, inventoryId)
+            GetSingleStagingPlan_Inventory = db.Fill(Of PortStagePlanInventory)(cmd)
+        End Using
+    End Function
+
+#End Region
+End Class

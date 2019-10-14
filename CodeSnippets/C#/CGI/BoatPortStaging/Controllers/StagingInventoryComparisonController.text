@@ -1,0 +1,267 @@
+Imports System.Web.Mvc
+Imports IPrime.Services
+Imports DocumentFormat.OpenXml.Spreadsheet
+Imports System.IO
+Imports IPrime.Web.OpenXML
+Imports System.Collections
+Imports System.Windows.Forms
+
+Namespace Controllers
+    Public Class StagingInventoryComparisonController
+        Inherits Controller
+
+        Private ReadOnly mStageValidationService As StagingValidationComponent = Nothing
+        Private ReadOnly mInventoryService As InventoryComponent = Nothing
+        Private ReadOnly mAccountService As AccountComponent = Nothing
+        Private pageSize = 50
+        Private Const addedStatus As String = "ADDED"
+        Private Const removedStatus As String = "REMOVED"
+
+        Public Sub New(stageValidationService As StagingValidationComponent)
+            mStageValidationService = stageValidationService
+            mInventoryService = IoC.Resolve(Of InventoryComponent)()
+            mAccountService = IoC.Resolve(Of AccountComponent)()
+        End Sub
+
+        ' GET: StagingInventoryComparison
+        Function Index() As ActionResult
+            Dim model As New StagingInventoryComparisonModel
+            Dim planInventoryList As New List(Of SelectListItem)
+            Dim currentAccount As Object = System.Web.HttpContext.Current.Profile
+            Dim selectedProfile = mAccountService.GetAccount(currentAccount.AccountId)
+
+            Dim inventories = mStageValidationService.GetAllActivePortStagingPlanInventories()
+
+            If inventories IsNot Nothing Then
+                If inventories.Count = 0 Then
+                    model.NoInventoriesToCompare = True
+                End If
+            Else
+                model.NoInventoriesToCompare = True
+            End If
+
+            If Not model.NoInventoriesToCompare Then
+                For Each plan In inventories.OrderByDescending(Function(f) f.DateCreated)
+                    Dim psi As New SelectListItem
+                    psi.Text = plan.Name
+                    psi.Value = plan.InventoryId.ToString + ":" + plan.DateCreated
+                    planInventoryList.Add(psi)
+                Next
+            End If
+
+            model.StagingInventoryDropBoxA = planInventoryList
+            model.StagingInventoryDropBoxB = planInventoryList
+
+            Return View("Index", model)
+        End Function
+
+        <ActionName("CompareBtnClick")>
+        Function CompareBtnClick(dropBoxValueA As String, dropBoxValueB As String) As ActionResult
+            Dim model As New StagingInventoryComparisonModel
+            Dim currentAccount As Object = System.Web.HttpContext.Current.Profile
+            Dim selectedProfile = mAccountService.GetAccount(currentAccount.AccountId)
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim ItemsInInventoryA_NotFoundInB As New List(Of IPrime.InventoryItem)
+            Dim ItemsInInventoryB_NotFoundInA As New List(Of IPrime.InventoryItem)
+            Dim endIndex = dropBoxValueA.IndexOf(":")
+            model.SelectedInventoryIdA = Guid.Parse(dropBoxValueA.Substring(0, endIndex))
+            model.SelectedInventoryIdB = Guid.Parse(dropBoxValueB.Substring(0, endIndex))
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlan = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItems = mStageValidationService.GetSelectedPortStage(portStagingPlan.PlanId)
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                If comparisonItem IsNot Nothing Then
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            model.InventoryComparison_AddedItems.Add(comparisonItem)
+                        End If
+                    End If
+
+                    'Removed Items~ IsFound: Yes -> IsFound: No
+                    If Item.IsFound Then
+                        If Not comparisonItem.IsFound Then
+                            model.InventoryComparison_RemovedItems.Add(comparisonItem)
+                        End If
+                    End If
+                Else
+                    'Also removed Items since item is missing from B
+                    If Item.IsFound Then
+                        Item.Modified = Date.MinValue
+                        Item.IsFound = False
+                        Item.LocationName = ""
+                        model.InventoryComparison_RemovedItems.Add(Item)
+                        ItemsInInventoryA_NotFoundInB.Add(Item)
+                    End If
+                End If
+            Next
+
+            'Check to see if there is an item in inventory B but not A
+            'For Each Item In inventoryItemsB
+            '    Dim comparisonItem = inventoryItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+            '    If comparisonItem Is Nothing Then
+            '        model.InventoryComparison_AddedItems.Add(Item)
+            '    End If
+            'Next
+
+            For Each Item In portStagingPlanItems
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each addedItem In model.InventoryComparison_AddedItems.OrderBy(Function(f) f.ItemId)
+                Dim item As New InventoryComparisonItem
+                item.Status = addedStatus
+                item.ItemId = addedItem.ItemId
+                item.NSN = addedItem.NSN
+                item.SerialNumber = addedItem.SerialNumber
+                item.PRI = portStagingPlanItems.FirstOrDefault(Function(f) f.NSN = addedItem.NSN AndAlso f.SerialNumber = addedItem.SerialNumber).LoadSequenceNumber
+                item.LocationName = addedItem.LocationName
+                item.Nomen = addedItem.Nomen
+                item.IsFound = addedItem.IsFound
+                item.Modified = addedItem.Modified
+                model.InventoryComparisonItems.Add(item)
+            Next
+            For Each removedItem In model.InventoryComparison_RemovedItems.OrderBy(Function(f) f.ItemId)
+                Dim item As New InventoryComparisonItem
+                item.Status = removedStatus
+                item.ItemId = removedItem.ItemId
+                item.NSN = removedItem.NSN
+                item.SerialNumber = removedItem.SerialNumber
+                item.PRI = portStagingPlanItems.FirstOrDefault(Function(f) f.NSN = removedItem.NSN AndAlso f.SerialNumber = removedItem.SerialNumber).LoadSequenceNumber
+                item.LocationName = removedItem.LocationName
+                item.Nomen = removedItem.Nomen
+                item.IsFound = removedItem.IsFound
+                item.Modified = removedItem.Modified
+                model.InventoryComparisonItems.Add(item)
+            Next
+
+            model.ShowComparison = True
+            Return View("Index", Model)
+        End Function
+
+        <ActionName("ExcelExportBtnClick_Method")>
+        Public Function ExcelExportBtnClick_Method(inventoryIdA As String, inventoryIdB As String) As ActionResult
+            Dim model As New StagingInventoryComparisonModel
+            Dim currentAccount As Object = System.Web.HttpContext.Current.Profile
+            Dim selectedProfile = mAccountService.GetAccount(currentAccount.AccountId)
+            Dim inventoryItemsA As New List(Of IPrime.InventoryItem)
+            Dim inventoryItemsB As New List(Of IPrime.InventoryItem)
+            Dim ItemsInInventoryA_NotFoundInB As New List(Of IPrime.InventoryItem)
+            Dim ItemsInInventoryB_NotFoundInA As New List(Of IPrime.InventoryItem)
+            model.SelectedInventoryIdA = Guid.Parse(inventoryIdA)
+            model.SelectedInventoryIdB = Guid.Parse(inventoryIdB)
+
+            inventoryItemsA = mInventoryService.GetInventoryItems(model.SelectedInventoryIdA)
+            inventoryItemsB = mInventoryService.GetInventoryItems(model.SelectedInventoryIdB)
+
+            Dim portStagingPlan = mStageValidationService.GetSinglePortStagingPlanInventory(model.SelectedInventoryIdA)
+            Dim portStagingPlanItems = mStageValidationService.GetSelectedPortStage(portStagingPlan.PlanId)
+
+            For Each Item In inventoryItemsA
+                Dim comparisonItem = inventoryItemsB.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+                If comparisonItem IsNot Nothing Then
+                    'Added Items~ IsFound: No -> IsFound: Yes
+                    If Not Item.IsFound Then
+                        If comparisonItem.IsFound Then
+                            model.InventoryComparison_AddedItems.Add(comparisonItem)
+                        End If
+                    End If
+
+                    'Removed Items~ IsFound: Yes -> IsFound: No
+                    If Item.IsFound Then
+                        If Not comparisonItem.IsFound Then
+                            model.InventoryComparison_RemovedItems.Add(comparisonItem)
+                        End If
+                    End If
+                Else
+                    'Also removed Items since item is missing from B 
+                    If Item.IsFound Then
+                        Item.Modified = Date.MinValue
+                        Item.IsFound = False
+                        Item.LocationName = ""
+                        model.InventoryComparison_RemovedItems.Add(Item)
+                        ItemsInInventoryA_NotFoundInB.Add(Item)
+                    End If
+                End If
+            Next
+
+            'Check to see if there is an item in inventory B but not A
+            'For Each Item In inventoryItemsB
+            '    Dim comparisonItem = inventoryItemsA.FirstOrDefault(Function(f) f.NSN = Item.NSN AndAlso f.SerialNumber = Item.SerialNumber)
+            '    If comparisonItem Is Nothing Then
+            '        model.InventoryComparison_AddedItems.Add(Item)
+            '    End If
+            'Next
+
+            For Each Item In portStagingPlanItems
+                If Item.LoadSequenceNumber Is Nothing Then
+                    Item.LoadSequenceNumber = 0
+                End If
+            Next
+
+            For Each addedItem In model.InventoryComparison_AddedItems.OrderBy(Function(f) f.ItemId)
+                Dim item As New InventoryComparisonItem
+                item.Status = addedStatus
+                item.ItemId = addedItem.ItemId
+                item.NSN = addedItem.NSN
+                item.SerialNumber = addedItem.SerialNumber
+                item.PRI = portStagingPlanItems.FirstOrDefault(Function(f) f.NSN = addedItem.NSN AndAlso f.SerialNumber = addedItem.SerialNumber).LoadSequenceNumber
+                item.LocationName = addedItem.LocationName
+                item.Nomen = addedItem.Nomen
+                item.IsFound = addedItem.IsFound
+                item.Modified = addedItem.Modified
+                model.InventoryComparisonItems.Add(item)
+            Next
+            For Each removedItem In model.InventoryComparison_RemovedItems.OrderBy(Function(f) f.ItemId)
+                Dim item As New InventoryComparisonItem
+                item.Status = removedStatus
+                item.ItemId = removedItem.ItemId
+                item.NSN = removedItem.NSN
+                item.SerialNumber = removedItem.SerialNumber
+                item.PRI = portStagingPlanItems.FirstOrDefault(Function(f) f.NSN = removedItem.NSN AndAlso f.SerialNumber = removedItem.SerialNumber).LoadSequenceNumber
+                item.LocationName = removedItem.LocationName
+                item.Nomen = removedItem.Nomen
+                item.IsFound = removedItem.IsFound
+                item.Modified = removedItem.Modified
+                model.InventoryComparisonItems.Add(item)
+            Next
+
+            model.ShowComparison = True
+            Return ExcelExport(model)
+        End Function
+
+        Public Function ExcelExport(model As StagingInventoryComparisonModel)
+            Dim filename As String = "Port_Staging_Inventory_Comparison_" & Date.UtcNow.ToString("yyyyMMdd_HHmmss") & ".xlsx"
+            Dim fields As String() = {"NSN", "SerialNumber", "PRI", "ItemId", "Nomen", "LocationName", "IsFound", "Modified", "Status"}
+            Dim headers As String() = {"NSN", "Serial Number", "PRI", "Item ID", "Nomenclature", "Location Name", "Found", "Modified", "Status"}
+
+            Using ms As New MemoryStream
+                Stanley.Common.OpenXml.CommonExcelSpreadsheet.ExportTo(ms, model.InventoryComparisonItems, "Inventory Comparison", fields, headers)
+
+                Return New ExcelExport_InventoryComparison(ms.ToArray(), filename)
+            End Using
+        End Function
+
+        Public Class ExcelExport_InventoryComparison
+            Inherits FileStreamResult
+
+            Private Const ExcelMimeType = "application/vnd.ms-excel"
+
+            Public Sub New(resultBytes As Byte(), filename As String)
+                MyBase.New(New MemoryStream(resultBytes), ExcelMimeType)
+                FileDownloadName = filename
+            End Sub
+
+        End Class
+
+        
+    End Class
+End Namespace

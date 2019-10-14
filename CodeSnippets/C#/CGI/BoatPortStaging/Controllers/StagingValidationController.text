@@ -1,0 +1,1038 @@
+Imports System.Web.Mvc
+Imports IPrime.Services
+Imports IPrime.Repository
+Imports IPrime.Web.Models.StagingValidation
+Imports System.IO
+Imports System.Diagnostics
+Imports Microsoft.AspNet.SignalR
+
+Namespace Controllers
+    Public Class StagingValidationController
+        Inherits Controller
+
+        Private ReadOnly mStageValidationService As StagingValidationComponent = Nothing
+        Private ReadOnly mAccountService As AccountComponent = Nothing
+        Private ReadOnly mCustodianService As CustodianComponent = Nothing
+        Private ReadOnly mSecurityService As ISecurityRepo = Nothing
+        Private ReadOnly mAcl As Acl = Nothing
+        Private ReadOnly resourceAccess As New ResourceAccess
+        Private ReadOnly mInventoryService As InventoryComponent = Nothing
+        Private ReadOnly mItemService As ItemComponent = Nothing
+
+        Dim pageSize = 25
+
+        Public Sub New(stageValidationService As StagingValidationComponent)
+            mStageValidationService = stageValidationService
+            mAccountService = IoC.Resolve(Of AccountComponent)()
+            mCustodianService = IoC.Resolve(Of CustodianComponent)()
+            mSecurityService = IoC.Resolve(Of ISecurityRepo)()
+            mAcl = IoC.Resolve(Of Acl)()
+            mInventoryService = IoC.Resolve(Of InventoryComponent)()
+            mItemService = IoC.Resolve(Of ItemComponent)()
+        End Sub
+
+        ' GET: StageValidation
+        Function Index() As ActionResult
+            Dim model As New StagingValidationModel
+
+            If TempData("CurrentPlanId") Is Nothing Then
+                Dim planList As New List(Of SelectListItem)
+                Dim IcodesloadPlanList As New List(Of SelectListItem)
+                Dim existingPortStagePlans As New List(Of SelectListItem)
+                Dim custodianList As New List(Of SelectListItem)
+                Dim currentAccount As Object = System.Web.HttpContext.Current.Profile
+                Dim selectedProfile = mAccountService.GetAccount(currentAccount.AccountId)
+
+                If TempData("SelectExistingPlan") IsNot Nothing Then
+                    model.SelectedPlanId = Guid.Parse(TempData("SelectExistingPlan"))
+                    model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+                    Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+                    model.AccountId = selectedPlan.AccountId
+                    model.AccountName = selectedPlan.Account
+                    model.Custodian = selectedPlan.Custodian
+                    model.ShowFilters = True
+                End If
+
+                If model.CreateNewPlan = False AndAlso Not TempData("CreateNewPlan") = True Then
+                    Dim x = New Dictionary(Of String, String)
+                    model.ExistingPortStagingPlans = mStageValidationService.GetAllPortStagingPlans(selectedProfile.AccountId)
+                    For Each plan In model.ExistingPortStagingPlans.OrderBy(Function(f) f.Value)
+                        Dim newPlan As New SelectListItem
+                        newPlan.Text = plan.Value
+                        newPlan.Value = plan.Key
+                        existingPortStagePlans.Add(newPlan)
+                    Next
+                    model.ExistingPortStagingPlansDropBox = existingPortStagePlans
+                    model.ExistingPlansExist = True
+                End If
+
+                If model.ExistingPortStagingPlans.Count = 0 OrElse TempData("CreateNewPlan") = True Then
+                    Dim custodians = mCustodianService.GetCustodiansByAccountId(selectedProfile.AccountId)
+
+                    model.AccountId = selectedProfile.AccountId
+                    model.AccountName = selectedProfile.Account
+
+                    For Each custodianItem In custodians
+                        Dim newCustodian As New SelectListItem
+                        newCustodian.Text = custodianItem.Custodian
+                        newCustodian.Value = custodianItem.CustodianId.ToString
+                        custodianList.Add(newCustodian)
+                    Next
+                    model.CustodiansDropBox = custodianList
+
+                    model.mdssIIPlans = mStageValidationService.GetAllPlans()
+                    For Each plan In model.mdssIIPlans.OrderBy(Function(f) f.Value)
+                        Dim newPlan As New SelectListItem
+                        newPlan.Text = plan.Key + " - " + plan.Value
+                        newPlan.Value = plan.Key
+                        planList.Add(newPlan)
+                    Next
+                    model.PlanDropBox = planList
+
+                    Dim icodesLoadPlan As New List(Of SelectListItem)
+                    model.IcodesLoadPlans = mStageValidationService.GetAllIcodesLoadPlans()
+                    For Each loadPlan In model.IcodesLoadPlans.OrderBy(Function(f) f.Value)
+                        Dim newPlan As New SelectListItem
+                        newPlan.Text = loadPlan.Value
+                        newPlan.Value = loadPlan.Key
+                        IcodesloadPlanList.Add(newPlan)
+                    Next
+                    model.IcodesLoadPlanDropBox = IcodesloadPlanList
+
+
+                    model.CreateNewPlan = True
+                End If
+            Else
+                model.SelectedPlanId = TempData("CurrentPlanId")
+                model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+                Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+                model.AccountId = selectedPlan.AccountId
+                model.AccountName = selectedPlan.Account
+                model.Custodian = selectedPlan.Custodian
+                model.ShowFilters = True
+            End If
+            Return View("Index", model)
+        End Function
+
+        <ActionName("CreateInventory")>
+        Function CreateInventory(selectedPlanId As String) As ActionResult
+            Dim model As New StagingValidationModel
+            Dim currentUserId = IPrimePrincipal.Current.UserId
+            Dim identities As New List(Of IPRIMEDataSet.IdentityRow)
+            Dim portOpsIdentity = mSecurityService.FetchIdentities().Identity.FirstOrDefault(Function(f) f.Name = "PortOps")
+
+            identities.Add(mSecurityService.FetchIdentities().Identity.FindBySID(currentUserId))
+
+            If portOpsIdentity IsNot Nothing Then
+                identities.Add(mSecurityService.FetchIdentities().Identity.FindBySID(portOpsIdentity.SID))
+                model.PortOpsSID = portOpsIdentity.SID
+            End If
+
+            model.SelectedMembers = identities
+            model.CurrentMemberSID = currentUserId
+
+            Dim temp_memberArray(model.SelectedMembers.Count - 1) As String
+            Dim arrayIndex = 0
+            For Each member In model.SelectedMembers
+                temp_memberArray(arrayIndex) = member.SID.ToString
+                arrayIndex += 1
+            Next
+
+            model.SelectedMembersSIDArray = temp_memberArray
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+            Return View("Create", model)
+        End Function
+
+        <ActionName("CreatePlaybook")>
+        Function CreatePlaybook(selectedPlanId As String) As ActionResult
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.PlaybookName = selectedPlan.Name
+
+            Return View("Playbook", model)
+        End Function
+
+        <HttpPost>
+        Function CreatePlaybookBtnClick(model As StagingValidationModel) As ActionResult
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            Dim portStageItems As IEnumerable(Of StageItem) = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId)
+            Dim currentUser As Object = IPrimePrincipal.Current
+
+            Dim pb = Playbook.CreateEmptyPlaybook
+            pb.AccountId = selectedPlan.AccountId
+            pb.Name = model.PlaybookName
+            pb.Description = If(String.IsNullOrEmpty(model.PlaybookDescription), "", model.PlaybookDescription)
+            pb.StartDate = model.PlaybookStartDate
+            pb.EndDate = model.PlaybookEndDate
+            pb.IsPublic = model.IsPublic
+            pb.ModifiedBy = currentUser.UserId
+            pb.ModifiedDate = Date.UtcNow
+
+            If pb.HasError Then
+                Return View("Playbook", model)
+            End If
+
+            IoC.Resolve(Of PlaybookComponent).CreatePlaybook(pb)
+
+            For Each Item In portStageItems
+                Dim iprimeItem As IPrime.Item = mItemService.FindItemByNsnAndSerialNumber(Item.NSN, Item.SerialNumber)
+                If iprimeItem IsNot Nothing Then
+                    IoC.Resolve(Of PlaybookComponent).AddPlaybookItem(pb.PlaybookId, iprimeItem.ItemGuid)
+                End If
+            Next
+
+            Return View("PlaybookCreated", model)
+        End Function
+
+        <HttpPost>
+        Function Remove(model As StagingValidationModel) As ActionResult
+            Dim identities As New List(Of IPRIMEDataSet.IdentityRow)
+            Dim currentUserId = IPrimePrincipal.Current.UserId.ToString
+
+            'If the chosen member to be removed is the current user, then decline the action
+            If currentUserId = model.RemoveMember Then
+                For Each SID In model.SelectedMembersSIDArray
+                    identities.Add(mSecurityService.FetchIdentities().Identity.FindBySID(Guid.Parse(SID)))
+                Next
+                model.RemoveMember = String.Empty
+                model.SelectedMembers = identities
+                Return View("Create", model)
+            End If
+
+            'Otherwise remove the member from the permissions table, and fetch the Identities
+            Dim newMembers = model.SelectedMembersSIDArray.Where(Function(f) f <> model.RemoveMember)
+            Dim temp_memberArray(newMembers.Count - 1) As String
+            Dim arrayIndexCount = 0
+            For Each SID In newMembers
+                temp_memberArray(arrayIndexCount) = SID
+                arrayIndexCount += 1
+            Next
+
+            For Each SID In temp_memberArray
+                identities.Add(mSecurityService.FetchIdentities().Identity.FindBySID(Guid.Parse(SID)))
+            Next
+
+            'Remove model state of previously selected members to re-apply new state of current chosen members 
+            For i = 0 To temp_memberArray.Count
+                ModelState.Remove(String.Format("SelectedMembersSIDArray[{0}]", i))
+            Next
+
+            model.SelectedMembers = identities
+            model.RemoveMember = String.Empty
+            model.AddMember = String.Empty
+            model.SelectedMembersSIDArray = temp_memberArray
+            model.InventoryName = model.InventoryNameRemove
+            model.InventoryDescription = model.InventoryDescriptionRemove
+            Return View("Create", model)
+        End Function
+
+        <HttpPost>
+        Function Add(model As StagingValidationModel) As ActionResult
+            Dim identities As New List(Of IPRIMEDataSet.IdentityRow)
+            Dim newMember = mSecurityService.FetchIdentities().Identity.FirstOrDefault(Function(f) f.Name = model.AddMember.Trim)
+
+            For Each SID In model.SelectedMembersSIDArray
+                identities.Add(mSecurityService.FetchIdentities().Identity.FindBySID(Guid.Parse(SID)))
+            Next
+
+            If newMember IsNot Nothing Then
+                Dim doesIdentityExist = identities.FirstOrDefault(Function(f) f.SID = newMember.SID)
+                If doesIdentityExist Is Nothing Then
+                    identities.Add(newMember)
+                End If
+            End If
+
+            Dim temp_memberArray(identities.Count - 1) As String
+            Dim arrayIndex = 0
+            For Each member In identities
+                temp_memberArray(arrayIndex) = member.SID.ToString
+                arrayIndex += 1
+            Next
+
+            model.SelectedMembers = identities
+            model.RemoveMember = String.Empty
+            model.AddMember = String.Empty
+            model.SelectedMembersSIDArray = temp_memberArray
+            model.InventoryName = model.InventoryNameAdd
+            model.InventoryDescription = model.InventoryDescriptionAdd
+            Return View("Create", model)
+        End Function
+
+        <HttpPost>
+        Function CreateNewInventory(model As StagingValidationModel) As ActionResult
+
+            If String.IsNullOrEmpty(model.InventoryName.Trim) Then
+                Return View("Create", model)
+            End If
+            If String.IsNullOrEmpty(model.InventoryDescription) Then
+                model.InventoryDescription = ""
+            End If
+
+            Dim newInventory As New Inventory
+            Dim accessors As New AccessorCollection
+            Dim portStagePlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            Dim portStageItems As IEnumerable(Of StageItem) = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId)
+            Dim currentUserId = IPrimePrincipal.Current.UserId
+            model.AccountName = portStagePlan.Account
+            model.AccountId = portStagePlan.AccountId
+
+            'Create New Inventory Plan
+            newInventory.InventoryId = Guid.NewGuid
+            newInventory.Type = "Custodian"
+            newInventory.AAC = portStagePlan.Account
+            newInventory.Custodian = portStagePlan.Custodian
+            newInventory.Name = model.InventoryName
+            newInventory.Descr = model.InventoryDescription
+            newInventory.FindUnknownItems = Inventory.UnknownItemFound.NoAllow
+            newInventory.ViewDefinedItems = Inventory.ViewDefinedItemsEnum.Allow
+            'newInventory.OpenDate = Nothing
+            newInventory.StartDate = Nothing
+            'newInventory.Changed = newInventory.OpenDate
+            newInventory.Status = "OPENED"
+            newInventory.Modified = DateTime.Now.ToUniversalTime
+
+            'Create inventory items
+            Dim newInventoryItems(portStageItems.Count - 1) As IPrime.InventoryItem
+            Dim arrayIndex = 0
+            For Each psItem In portStageItems
+                Dim newItem As New IPrime.InventoryItem
+                newItem.InventoryId = newInventory.InventoryId
+                newItem.AssetId = ""
+                newItem.UII = ""
+                newItem.EpcId = ""
+                newItem.NSN = psItem.NSN
+                newItem.SerialNumber = psItem.SerialNumber
+                newItem.ItemId = psItem.ItemId
+                newItem.Nomen = psItem.Nomen
+                newItem.LocationId = Guid.Empty
+                newItem.LocationName = ""
+                newItem.IsFound = False
+                newItem.FoundType = "UNKNOWN"
+                newItem.Status = "STATIC"
+                newItem.DeviceType = ""
+                newItem.DeviceId = ""
+                newItem.Modified = DateTime.Now.ToUniversalTime
+                newItem.Changed = newItem.Modified
+                newItem.SyncId = Guid.Empty
+                newItem.Latitude = 0
+                newItem.Longitude = 0
+                newInventoryItems(arrayIndex) = newItem
+                arrayIndex += 1
+            Next
+            For Each Item In newInventoryItems
+                Dim iprimeItem As IPrime.Item = mItemService.FindItemByNsnAndSerialNumber(Item.NSN, Item.SerialNumber)
+                If iprimeItem IsNot Nothing Then
+                    Item.ItemGuid = iprimeItem.ItemGuid
+                    Item.AssetId = iprimeItem.AssetId
+                    Item.LocationId = iprimeItem.LocationId
+                    Item.LocationName = iprimeItem.LocationName
+                    Item.UII = iprimeItem.Uii
+                    Item.Latitude = iprimeItem.Latitude
+                    Item.Longitude = iprimeItem.Longitude
+                    Item.EpcId = iprimeItem.PassiveTagId
+                Else
+                    Item.ItemGuid = Guid.NewGuid
+                    'Flag
+                End If
+            Next
+
+            'Add Permissions and Accessors; Grant Access To User
+            For Each SID In model.SelectedMembersSIDArray
+                Dim memberId = Guid.Parse(SID)
+                Dim member = mSecurityService.FetchIdentities().Identity.FindBySID(memberId)
+                Dim permission As New Permission
+                Dim userRights As New Accessor
+
+                'Permission
+                If currentUserId = memberId Then
+                    permission.Access = resourceAccess.Account.Inventories.Owner
+                    userRights = Accessor.CreateUser(currentUserId,
+                                        IPrimePrincipal.Current.DisplayName)
+
+                    userRights.Permissions.Create(newInventory.InventoryId,
+                                             resourceAccess.Account.Inventories.Owner)
+                    userRights.Permissions.Create(newInventory.InventoryId,
+                                             resourceAccess.Account.Inventories.Perform)
+                Else
+                    permission.Access = resourceAccess.Account.Inventories.Perform
+                    userRights = Accessor.CreateUser(memberId,
+                                        IPrimePrincipal.Current.DisplayName)
+
+                    userRights.Permissions.Create(newInventory.InventoryId,
+                                             resourceAccess.Account.Inventories.Perform)
+                End If
+                permission.PermissionId = Guid.NewGuid
+                permission.ResourceId = newInventory.InventoryId
+
+                'Access
+                userRights.SID = member.SID
+                userRights.Type = member.Type
+                userRights.Name = member.Name
+                userRights.Permissions.Add(permission)
+                accessors.Add(userRights)
+            Next
+
+            'CREATE INVENTORY
+            newInventory.Items = newInventoryItems
+            mInventoryService.CreateInventory(newInventory, accessors, currentUserId)
+
+            'Insert into PortStage_Inventory Bridge table
+            mStageValidationService.InsertPortStagingPlan_Inventory(portStagePlan.PlanId, newInventory.InventoryId, DateTime.Now.ToUniversalTime)
+
+            Return View("Complete", model)
+        End Function
+
+        Public Function GetMemberNames_AutoComplete(nameInput As String) As ActionResult
+            Const maxNames = 7
+            Dim nameCount = 0
+            Dim model As New StagingValidationModel
+            Dim allMembers = mSecurityService.FetchIdentities()
+
+            For Each member In allMembers.Identity
+                model.AllMembersName_AutoComplete.Add(member.Name)
+            Next
+
+            Dim matches As New List(Of String)
+
+            For Each mName In model.AllMembersName_AutoComplete
+                If mName.ToUpper.StartsWith(nameInput.ToUpper) AndAlso nameCount < maxNames Then
+                    matches.Add(mName)
+                    nameCount += 1
+                End If
+            Next
+
+            Return Json((matches.Distinct()), JsonRequestBehavior.AllowGet)
+        End Function
+
+        <ActionName("FilterBtnClick_Method")>
+        Public Function FilterBtnClick_Method(serialNumber As String, LoadSequenceNumber As Integer?, allRadioBtn As Boolean, flaggedRadioBtn As Boolean, unassignedRadioBtn As Boolean, unmatchedRadioBtn As Boolean, selectedPlanId As String)
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+            If Not String.IsNullOrEmpty(serialNumber) Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.SerialNumber.Contains(serialNumber))
+                model.SerialNumberFilter = serialNumber
+                model.ShowFilters = True
+            End If
+
+            If LoadSequenceNumber IsNot Nothing Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber = LoadSequenceNumber)
+                model.SerialNumberFilter = serialNumber
+                model.LoadSequenceNumberFilter = LoadSequenceNumber
+                model.ShowFilters = True
+            End If
+
+            If flaggedRadioBtn = True Then
+                'first, check for any duplicates. Then check other flagged categories.
+                Dim duplicates = model.StagingItems.GroupBy(Function(f) f.SerialNumber).Where(Function(g) g.Count() > 1).Select(Function(h) h)
+
+                model.StagingItems = model.StagingItems.Where(Function(f) f.IsItemNoMatchingSequenceAndPriority = True OrElse f.ItemInICODES = False OrElse f.UnassignedLoadSequenceNumber = True)
+
+                If duplicates IsNot Nothing Then
+                    Dim updatedList As New List(Of StageItem)
+                    For Each Group In duplicates
+                        For Each item In Group
+                            updatedList.Add(item)
+                        Next
+                    Next
+
+                    If updatedList.Count > 0 Then
+                        updatedList.AddRange(model.StagingItems)
+                        model.StagingItems = updatedList.Distinct.ToList
+                    End If
+                End If
+
+                model.SerialNumberFilter = serialNumber
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = True
+                model.RadioButton_UnassignedSelected = False
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = False
+                model.ShowFilters = True
+            End If
+            If unassignedRadioBtn = True Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber IsNot Nothing)
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber = 0)
+                model.SerialNumberFilter = serialNumber
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = False
+                model.RadioButton_UnassignedSelected = True
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = False
+                model.ShowFilters = True
+            End If
+
+            If unmatchedRadioBtn = True Then
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = False
+                model.RadioButton_UnassignedSelected = False
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = True
+
+                Dim iprimeItems = mItemService.GetItemsByAccountAndCustodian(selectedPlan.AccountId, selectedPlan.CustodianId)
+                Dim itemsNotInCurrentAccountOrCustodian As New List(Of IPrime.Item)
+                Dim itemsNotFoundInIPrime As New List(Of IPrime.Item)
+
+                For Each sItem In model.StagingItems
+                    Dim existInIPrime = iprimeItems.FirstOrDefault(Function(f) f.Nsn = sItem.NSN AndAlso f.SerialNumber = sItem.SerialNumber)
+
+                    If existInIPrime Is Nothing Then
+                        Dim foundItem = mItemService.FindItemByNsnAndSerialNumber(sItem.NSN, sItem.SerialNumber)
+
+                        If foundItem IsNot Nothing Then
+                            itemsNotInCurrentAccountOrCustodian.Add(foundItem)
+                        Else
+                            itemsNotFoundInIPrime.Add(New IPrime.Item With {.Nsn = sItem.NSN, .SerialNumber = sItem.SerialNumber, .Nomen = sItem.SerialNumber, .ItemId = sItem.ItemId})
+                        End If
+                    End If
+                Next
+                model.ItemsNotInCurrentAccountOrCustodian = itemsNotInCurrentAccountOrCustodian
+                model.SelectedPageSize = model.ItemsNotInCurrentAccountOrCustodian.Count
+            End If
+
+            model.ShowFilters = True
+            Return View("Index", model)
+        End Function
+
+        <ActionName("ClearBtnClick_Method")>
+        Public Function ClearBtnClick_Method(selectedPlanId As String)
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+            model.ShowFilters = True
+
+            Return View("Index", model)
+        End Function
+
+        <ActionName("RadioBtnChange_Method")>
+        Public Function RadioBtnChange_Method(serialNumber As String, LoadSequenceNumber As Object, allRadioBtn As Boolean, flaggedRadioBtn As Boolean, unassignedRadioBtn As Boolean, unmatchedRadioBtn As Boolean, selectedPlanId As String)
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+
+            Dim loadSqNum = Integer.TryParse(LoadSequenceNumber(0).ToString, True)
+            If Not loadSqNum Then
+                LoadSequenceNumber = Nothing
+            Else
+                LoadSequenceNumber = Integer.Parse(LoadSequenceNumber(0).ToString)
+            End If
+
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+            If Not String.IsNullOrEmpty(serialNumber) Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.SerialNumber.Contains(serialNumber))
+                model.SerialNumberFilter = serialNumber
+                model.ShowFilters = True
+            End If
+
+            If LoadSequenceNumber IsNot Nothing Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber = LoadSequenceNumber)
+                model.SerialNumberFilter = serialNumber
+                model.LoadSequenceNumberFilter = LoadSequenceNumber
+                model.ShowFilters = True
+            End If
+
+            If flaggedRadioBtn = True Then
+                'first, check for any duplicates. Then check other flagged categories.
+                Dim duplicates = model.StagingItems.GroupBy(Function(f) f.SerialNumber).Where(Function(g) g.Count() > 1).Select(Function(h) h)
+
+                model.StagingItems = model.StagingItems.Where(Function(f) f.IsItemNoMatchingSequenceAndPriority = True OrElse f.ItemInICODES = False OrElse f.UnassignedLoadSequenceNumber = True OrElse f.DoesLoadSequenceNumberExceedNormalPlaceValueSize = True)
+
+                If duplicates IsNot Nothing Then
+                    Dim updatedList As New List(Of StageItem)
+                    For Each Group In duplicates
+                        For Each item In Group
+                            updatedList.Add(item)
+                        Next
+                    Next
+
+                    If updatedList.Count > 0 Then
+                        updatedList.AddRange(model.StagingItems)
+                        model.StagingItems = updatedList.Distinct.ToList
+                    End If
+                End If
+
+                model.SerialNumberFilter = serialNumber
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = True
+                model.RadioButton_UnassignedSelected = False
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = False
+                model.ShowFilters = True
+            End If
+            If unassignedRadioBtn = True Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber IsNot Nothing)
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber = 0)
+                model.SerialNumberFilter = serialNumber
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = False
+                model.RadioButton_UnassignedSelected = True
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = False
+                model.ShowFilters = True
+            End If
+
+            If unmatchedRadioBtn = True Then
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = False
+                model.RadioButton_UnassignedSelected = False
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = True
+
+                Dim iprimeItems = mItemService.GetItemsByAccountAndCustodian(selectedPlan.AccountId, selectedPlan.CustodianId)
+                Dim itemsNotInCurrentAccountOrCustodian As New List(Of IPrime.Item)
+                Dim itemsNotFoundInIPrime As New List(Of IPrime.Item)
+
+                For Each sItem In model.StagingItems
+                    Dim existInIPrime = iprimeItems.FirstOrDefault(Function(f) f.Nsn = sItem.NSN AndAlso f.SerialNumber = sItem.SerialNumber)
+
+                    If existInIPrime Is Nothing Then
+                        Dim foundItem = mItemService.FindItemByNsnAndSerialNumber(sItem.NSN, sItem.SerialNumber)
+
+                        If foundItem IsNot Nothing Then
+                            itemsNotInCurrentAccountOrCustodian.Add(foundItem)
+                        Else
+                            itemsNotFoundInIPrime.Add(New IPrime.Item With {.Nsn = sItem.NSN, .SerialNumber = sItem.SerialNumber, .Nomen = sItem.SerialNumber, .ItemId = sItem.ItemId})
+                        End If
+                    End If
+                Next
+                model.ItemsNotInCurrentAccountOrCustodian = itemsNotInCurrentAccountOrCustodian
+                model.SelectedPageSize = model.ItemsNotInCurrentAccountOrCustodian.Count
+            End If
+
+            model.ShowFilters = True
+            Return View("Index", model)
+        End Function
+
+        <ActionName("ExcelExportBtnClick_Method")>
+        Public Function ExcelExportBtnClick_Method(selectedPlanId As String)
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+
+            If model.SelectedPlanId <> Nothing Then
+                model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+                Dim arrayIndex = 0
+                ReDim model.StagingItemsArray(model.StagingItems.Count - 1)
+                For Each sItem In model.StagingItems
+                    Dim arrayStageItemExport As New StagingItemForExport With {.ItemId = sItem.ItemId.ToString, .NSN = sItem.NSN,
+                                                                               .SerialNumber = sItem.SerialNumber, .Nomen = sItem.Nomen,
+                                                                               .Association = sItem.Association, .LoadNumber = sItem.LoadNumber,
+                                                                               .LoadSequenceNumber = sItem.LoadSequenceNumber.ToString}
+                    model.StagingItemsArray(arrayIndex) = arrayStageItemExport
+                    arrayIndex += 1
+                Next
+                model.ShowExcel = True
+                model.ShowFilters = True
+                Return ExcelExport(model)
+            Else
+                Return RedirectToAction("Index")
+            End If
+        End Function
+
+        Public Function ExcelExport(model As StagingValidationModel)
+            Dim filename As String = "Port_Staging_And_Validation_" & Date.UtcNow.ToString("yyyyMMdd_HHmmss") & ".xlsx"
+            Dim fields As String() = {"ItemId", "NSN", "SerialNumber", "Nomen", "Association", "LoadNumber", "LoadSequenceNumber"}
+            Dim headers As String() = {"Item ID", "NSN", "Serial Number", "Nomenclature", "Association", "Load Number", "Load Sequence Number"}
+
+            Using ms As New MemoryStream
+                Stanley.Common.OpenXml.CommonExcelSpreadsheet.ExportTo(ms, model.StagingItemsArray, "Report", fields, headers)
+
+                Return New ExcelExport_PortStageValidation(ms.ToArray(), filename)
+            End Using
+        End Function
+
+        Public Class ExcelExport_PortStageValidation
+            Inherits FileStreamResult
+
+            Private Const ExcelMimeType = "application/vnd.ms-excel"
+
+            Public Sub New(resultBytes As Byte(), filename As String)
+                MyBase.New(New MemoryStream(resultBytes), ExcelMimeType)
+                FileDownloadName = filename
+            End Sub
+
+        End Class
+
+        <ActionName("CreatePlanBtnClick_Method")>
+        Public Function CreatePlanBtnClick_Method()
+            Dim model As New StagingValidationModel
+            Dim planList As New List(Of SelectListItem)
+            Dim IcodesloadPlanList As New List(Of SelectListItem)
+            Dim existingPortStagePlans As New List(Of SelectListItem)
+            Dim custodianList As New List(Of SelectListItem)
+            Dim currentAccount As Object = System.Web.HttpContext.Current.Profile
+            Dim selectedProfile = mAccountService.GetAccount(currentAccount.AccountId)
+            Dim custodians = mCustodianService.GetCustodiansByAccountId(selectedProfile.AccountId)
+
+            model.AccountId = selectedProfile.AccountId
+            model.AccountName = selectedProfile.Account
+
+            For Each custodianItem In custodians
+                Dim newCustodian As New SelectListItem
+                newCustodian.Text = custodianItem.Custodian
+                newCustodian.Value = custodianItem.CustodianId.ToString
+                custodianList.Add(newCustodian)
+            Next
+            model.CustodiansDropBox = custodianList
+
+            model.mdssIIPlans = mStageValidationService.GetAllPlans()
+            For Each plan In model.mdssIIPlans.OrderBy(Function(f) f.Value)
+                Dim newPlan As New SelectListItem
+                newPlan.Text = plan.Key + " - " + plan.Value
+                newPlan.Value = plan.Key
+                planList.Add(newPlan)
+            Next
+            model.PlanDropBox = planList
+
+            Dim icodesLoadPlan As New List(Of SelectListItem)
+            model.IcodesLoadPlans = mStageValidationService.GetAllIcodesLoadPlans()
+            For Each loadPlan In model.IcodesLoadPlans.OrderBy(Function(f) f.Value)
+                Dim newPlan As New SelectListItem
+                newPlan.Text = loadPlan.Value
+                newPlan.Value = loadPlan.Key
+                IcodesloadPlanList.Add(newPlan)
+            Next
+            model.IcodesLoadPlanDropBox = IcodesloadPlanList
+
+            Dim existingPlans = mStageValidationService.GetAllPortStagingPlans(selectedProfile.AccountId)
+            For Each plan In existingPlans
+                model.ExistingPortStagingPlanNames.Add(plan.Value)
+            Next
+
+            model.CreateNewPlan = True
+            model.ExistingPlansExist = True
+
+            Return View("Index", model)
+        End Function
+
+        <ActionName("SelectExistingPlan_Click")>
+        Public Function SelectExistingPlan_Click(existingPlan As String)
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(existingPlan)
+            model.ShowFilters = True
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+
+            Return View("Index", model)
+        End Function
+
+        <ActionName("Update")>
+        Public Function Update(currentPlanId As Guid)
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = currentPlanId
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+            model.ShowFilters = True
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+            Return View("Index", model)
+        End Function
+
+        <ActionName("PageSizeDropDownList_Click")>
+        Public Function PageSizeDropDownList(rowsPerPage As Integer, serialNumber As String, LoadSequenceNumber As Integer?, allRadioBtn As Boolean, flaggedRadioBtn As Boolean, unassignedRadioBtn As Boolean, unmatchedRadioBtn As Boolean, selectedPlanId As String) As ActionResult
+            Dim model As New StagingValidationModel
+            model.SelectedPlanId = Guid.Parse(selectedPlanId)
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.Custodian = selectedPlan.Custodian
+
+            If rowsPerPage <> 0 Then
+                pageSize = rowsPerPage
+            Else
+                pageSize = model.StagingItems.Count
+            End If
+
+            model.SelectedPageSize = pageSize
+
+            If Not String.IsNullOrEmpty(serialNumber) Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.SerialNumber.Contains(serialNumber))
+                model.SerialNumberFilter = serialNumber
+                model.ShowFilters = True
+            End If
+
+            If LoadSequenceNumber IsNot Nothing Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber = LoadSequenceNumber)
+                model.SerialNumberFilter = serialNumber
+                model.LoadSequenceNumberFilter = LoadSequenceNumber
+                model.ShowFilters = True
+            End If
+
+            If flaggedRadioBtn = True Then
+                'first, check for any duplicates. Then check other flagged categories.
+                Dim duplicates = model.StagingItems.GroupBy(Function(f) f.SerialNumber).Where(Function(g) g.Count() > 1).Select(Function(h) h)
+
+                model.StagingItems = model.StagingItems.Where(Function(f) f.IsItemNoMatchingSequenceAndPriority = True OrElse f.ItemInICODES = False OrElse f.UnassignedLoadSequenceNumber = True)
+
+                If duplicates IsNot Nothing Then
+                    Dim updatedList As New List(Of StageItem)
+                    For Each Group In duplicates
+                        For Each item In Group
+                            updatedList.Add(item)
+                        Next
+                    Next
+
+                    If updatedList.Count > 0 Then
+                        updatedList.AddRange(model.StagingItems)
+                        model.StagingItems = updatedList.Distinct.ToList
+                    End If
+                End If
+
+                model.SerialNumberFilter = serialNumber
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = True
+                model.RadioButton_UnassignedSelected = False
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = False
+                model.ShowFilters = True
+            End If
+            If unassignedRadioBtn = True Then
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber IsNot Nothing)
+                model.StagingItems = model.StagingItems.Where(Function(f) f.LoadSequenceNumber = 0)
+                model.SerialNumberFilter = serialNumber
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = False
+                model.RadioButton_UnassignedSelected = True
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = False
+                model.ShowFilters = True
+            End If
+
+            If unmatchedRadioBtn = True Then
+                model.RadioButton_AllItemsSelected = False
+                model.RadioButton_FlaggedItemsSelected = False
+                model.RadioButton_UnassignedSelected = False
+                model.RadioButton_UnmatchedAccountAndCustodianSelected = True
+
+                Dim iprimeItems = mItemService.GetItemsByAccountAndCustodian(selectedPlan.AccountId, selectedPlan.CustodianId)
+                Dim itemsNotInCurrentAccountOrCustodian As New List(Of IPrime.Item)
+                Dim itemsNotFoundInIPrime As New List(Of IPrime.Item)
+
+                For Each sItem In model.StagingItems
+                    Dim existInIPrime = iprimeItems.FirstOrDefault(Function(f) f.Nsn = sItem.NSN AndAlso f.SerialNumber = sItem.SerialNumber)
+
+                    If existInIPrime Is Nothing Then
+                        Dim foundItem = mItemService.FindItemByNsnAndSerialNumber(sItem.NSN, sItem.SerialNumber)
+
+                        If foundItem IsNot Nothing Then
+                            itemsNotInCurrentAccountOrCustodian.Add(foundItem)
+                        Else
+                            itemsNotFoundInIPrime.Add(New IPrime.Item With {.Nsn = sItem.NSN, .SerialNumber = sItem.SerialNumber, .Nomen = sItem.SerialNumber, .ItemId = sItem.ItemId})
+                        End If
+                    End If
+                Next
+                model.ItemsNotInCurrentAccountOrCustodian = itemsNotInCurrentAccountOrCustodian
+                model.SelectedPageSize = model.ItemsNotInCurrentAccountOrCustodian.Count
+            End If
+
+            model.ShowFilters = True
+
+            Return View("Index", model)
+        End Function
+
+        <HttpPost>
+        Public Function ReconcileItems(model As StagingValidationModel, form As FormCollection) As ActionResult
+            Dim selectedPlan As StagePlan = mStageValidationService.GetSinglePortPlan(model.SelectedPlanId)
+            model.AccountId = selectedPlan.AccountId
+            model.AccountName = selectedPlan.Account
+            model.CustodianId = selectedPlan.CustodianId
+            model.Custodian = selectedPlan.Custodian
+
+            model.StagingItems = mStageValidationService.GetSelectedPortStage(model.SelectedPlanId).OrderBy(Function(f) f.LoadSequenceNumber).ToList
+
+            If form.Get("ItemGuid") IsNot Nothing Then
+                Dim itemIds = From itemIdString In form.GetValues("ItemGuid")
+                              Select Guid.Parse(itemIdString)
+
+                If itemIds.Any Then
+                    Dim checkedItemIds As Guid() = {}
+
+                    If form.Get("isSelected") IsNot Nothing Then
+                        checkedItemIds = (From itemIdString In form.GetValues("isSelected")
+                        Select Guid.Parse(itemIdString)).ToArray
+                    End If
+
+                    If checkedItemIds.Count > 0 Then
+                        'TODO: Set Account and Custodian of items to current selected
+                        For Each id In checkedItemIds
+                            mItemService.UpdateAccountAndCustodianOfItemByItemGuid(id, model.AccountId, model.CustodianId)
+                        Next
+                    End If
+
+                End If
+            End If
+
+            Dim iprimeItems = mItemService.GetItemsByAccountAndCustodian(selectedPlan.AccountId, selectedPlan.CustodianId)
+            Dim itemsNotInCurrentAccountOrCustodian As New List(Of IPrime.Item)
+            Dim itemsNotFoundInIPrime As New List(Of IPrime.Item)
+
+            For Each sItem In model.StagingItems
+                Dim existInIPrime = iprimeItems.FirstOrDefault(Function(f) f.Nsn = sItem.NSN AndAlso f.SerialNumber = sItem.SerialNumber)
+
+                If existInIPrime Is Nothing Then
+                    Dim foundItem = mItemService.FindItemByNsnAndSerialNumber(sItem.NSN, sItem.SerialNumber)
+
+                    If foundItem IsNot Nothing Then
+                        itemsNotInCurrentAccountOrCustodian.Add(foundItem)
+                    Else
+                        itemsNotFoundInIPrime.Add(New IPrime.Item With {.Nsn = sItem.NSN, .SerialNumber = sItem.SerialNumber, .Nomen = sItem.SerialNumber, .ItemId = sItem.ItemId})
+                    End If
+                End If
+            Next
+
+            model.ItemsNotInCurrentAccountOrCustodian = itemsNotInCurrentAccountOrCustodian
+            model.SelectedPageSize = model.ItemsNotInCurrentAccountOrCustodian.Count
+            model.RadioButton_AllItemsSelected = False
+            model.RadioButton_FlaggedItemsSelected = False
+            model.RadioButton_UnassignedSelected = False
+            model.RadioButton_UnmatchedAccountAndCustodianSelected = True
+            model.ShowFilters = True
+            Return View("Index", model)
+        End Function
+    End Class
+
+    Public Class StagingValidationService
+        Private Const PageSize As Integer = 25
+        Private ReadOnly _component As StagingValidationComponent
+        Private ReadOnly _connectionId As String
+        Private ReadOnly _mdssPlanId As Integer
+        Private ReadOnly _icodesPlanId As String
+        Private ReadOnly _portStagePlanName As String
+        Private ReadOnly _accountId As String
+        Private ReadOnly _custodianId As String
+        Private ReadOnly _eDayDate As String
+        Private ReadOnly mAccountService As AccountComponent = Nothing
+        Private ReadOnly mCustodianService As CustodianComponent = Nothing
+
+        Public Sub New(connectionId As String, planId As Integer, icodesPlanId As String, portStagePlanName As String, accountId As String, custodianId As String, eDayDate As String)
+            _component = IoC.Resolve(Of StagingValidationComponent)()
+            _connectionId = connectionId
+            _mdssPlanId = planId
+            _icodesPlanId = icodesPlanId
+            _portStagePlanName = portStagePlanName
+            _accountId = accountId
+            _custodianId = custodianId
+            _eDayDate = eDayDate
+            mAccountService = IoC.Resolve(Of AccountComponent)()
+            mCustodianService = IoC.Resolve(Of CustodianComponent)()
+        End Sub
+
+        Public Function StartAsync() As System.Threading.Tasks.Task
+            Return System.Threading.Tasks.Task.Factory.StartNew(AddressOf OnStart)
+        End Function
+
+        Private Sub OnStart()
+            Debug.WriteLine("Started")
+            SendMessage("Started")
+            SendMessage(String.Format("Getting MDSS-II Plan Data for Plan ID: {0}", _mdssPlanId))
+
+            Dim mdssItems = _component.GetMDSSIIPlanItems(_mdssPlanId)
+            Dim virtualContainers As IEnumerable(Of String) = _component.GetAllContainers()
+            Dim currentAccount = mAccountService.GetAccount(Guid.Parse(_accountId))
+            Dim selectedCustodian = mCustodianService.GetCustodian(Guid.Parse(_custodianId))
+            Dim eDayDate = DateTime.Parse(_eDayDate)
+
+            'Filter the MDSSII items to not include associated items that not null or hitched, also filter out the requested
+            Dim items As New List(Of StageItem)
+            For Each mItem In mdssItems
+                If mItem.Association = String.Empty Or mItem.Association = "HITCHED" Then
+                    If mItem.ItemId <> "KZ067" AndAlso mItem.ItemId <> "KZ017" AndAlso mItem.ItemId <> "057093" AndAlso mItem.ItemId <> "057095" AndAlso mItem.ItemId <> "057096" AndAlso mItem.ItemId <> "057097" AndAlso mItem.ItemId <> "057061" AndAlso mItem.ItemId <> "ZM310" AndAlso mItem.NSN <> "5430015472539" Then
+                        items.Add(mItem)
+                    End If
+                End If
+            Next
+
+            Dim total = items.Count()
+            Dim portStagePlanId As Guid = Guid.NewGuid
+
+            SendMessage(String.Format("Received {0} items from MDSS-II, Processing against ICODES", items.Count()))
+
+            Dim index = 0
+            Dim paged = items.Skip(index).Take(PageSize)
+            index += paged.Count()
+
+            _component.InsertPortStageValidationPlan(portStagePlanId, _portStagePlanName, _mdssPlanId, Guid.Parse(_icodesPlanId), currentAccount.Account, currentAccount.AccountId, selectedCustodian.Custodian, selectedCustodian.CustodianId, eDayDate)
+
+            While (paged.Count() > 0)
+                Dim percent = Math.Round((index / total) * 100)
+                SendMessage(String.Format("Processing: {0}% against ICODES", percent))
+
+                paged = _component.AssignLoadSequenceNumbers(_icodesPlanId, paged)
+                _component.InsertPortStageValidationPlanItems(portStagePlanId, paged)
+
+                SendMessage("Items", False, paged)
+                Threading.Thread.Sleep(500)
+
+                paged = items.Skip(index).Take(PageSize)
+                index += paged.Count()
+            End While
+
+            SendMessage("Completed", True, Nothing, portStagePlanId)
+            Debug.WriteLine("Completed")
+        End Sub
+
+        Private Sub SendMessage(message As String, Optional isDone As Boolean = False, Optional state As Object = Nothing, Optional currentPlan As Guid = Nothing)
+            StagingValidationConnection.Send(_connectionId, New With {.Message = message, .Timestamp = DateTime.Now, .IsDone = isDone, .State = state, .currentPlan = currentPlan})
+        End Sub
+
+    End Class
+
+    Public Class StagingValidationConnection
+        Inherits PersistentConnection
+
+        Public Sub New()
+            Dim x = 10
+        End Sub
+
+        Public Shared Sub Send(connectionId As String, obj As Object)
+            GlobalHost.ConnectionManager.GetConnectionContext(Of StagingValidationConnection).Connection.Send(connectionId, obj)
+        End Sub
+
+        Protected Overrides Function OnReceived(request As IRequest, connectionId As String, data As String) As Threading.Tasks.Task
+            Dim plan = Newtonsoft.Json.JsonConvert.DeserializeObject(Of SelectedPlan)(data)
+
+            If (Regex.IsMatch(plan.MDSSII, "^[0-9]{1,10}$") AndAlso Guid.TryParse(plan.ICODES, System.Guid.NewGuid)) Then
+                Dim service = New StagingValidationService(connectionId, Integer.Parse(plan.MDSSII), plan.ICODES, plan.PlanName, plan.AccountId, plan.CustodianId, plan.EDayDate)
+
+                Return service.StartAsync()
+            End If
+
+            Return MyBase.OnReceived(request, connectionId, data)
+        End Function
+
+        Private Class SelectedPlan
+            Public Property MDSSII As String
+            Public Property ICODES As String
+            Public Property PlanName As String
+            Public Property AccountId As String
+            Public Property CustodianId As String
+            Public Property EDayDate As String
+        End Class
+
+    End Class
+End Namespace

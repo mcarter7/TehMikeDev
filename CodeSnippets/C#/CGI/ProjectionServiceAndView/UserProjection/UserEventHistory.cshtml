@@ -1,0 +1,287 @@
+﻿@model IMarkReporting.Web.Models.Report.UserEventHistoryModel
+
+@{
+    ViewBag.Title = "UserEventHistory";
+}
+
+<h2>User Event History</h2>
+
+<script src="~/Scripts/jquery-1.10.2.js"></script>
+<script src="~/Scripts/jquery-ui-1.10.0.js"></script>
+<link href="@Url.Content("~/Content/themes/base/jquery.ui.datepicker.css")" rel="stylesheet" type="text/css" />
+<link href="@Url.Content("~/Content/themes/base/minified/jquery.ui.datepicker.min.css")" rel="stylesheet" type="text/css" />
+<link href="@Url.Content("~/Content/themes/base/jquery-ui.css")" rel="stylesheet" type="text/css" />
+
+
+<style type="text/css">
+    ul.ui-autocomplete {
+        list-style: none;
+        background-color: white;
+        width: 215px;
+        padding: 0;
+        display: block;
+    }
+
+    .ui-state-hover, .ui-widget-content .ui-state-hover, .ui-widget-header .ui-state-hover, .ui-state-focus, .ui-widget-content .ui-state-focus, .ui-widget-header .ui-state-focus {
+        background: #18AE7E;
+        border: none;
+        color: #000;
+        border-radius: 0;
+        font-weight: normal;
+    }
+
+    table#ItemHistoryTable td, table#ItemHistoryTable th, table#ItemHistoryTable {
+        padding: 5px;
+        border: 1px solid black;
+        border-collapse: collapse;
+    }
+
+        table#ItemHistoryTable tr:nth-child(even) {
+            background-color: white;
+        }
+
+        table#ItemHistoryTable tr:nth-child(odd) {
+            background-color: #FBFBFB;
+        }
+</style>
+
+<script type="text/javascript">
+    $(function () {
+        $("#Name").autocomplete({
+            source: function (request, response) {
+                $.getJSON("@Url.Action("FindName")", "selectedName=" + request.term, function(data) {
+                    response(data);
+                });
+            },
+            select: function (event, ui) {
+                var selectedName = ui.item.value;
+                $("Name").val(selectedName);
+                console.log(selectedName);
+               //$('#SearchButton').click();
+            }
+        });
+
+        $("#StartDate").datepicker();
+        $("#EndDate").datepicker();
+    });
+
+    function SearchBtnClick() {
+        var name = $("#Name")[0].value
+        var startDate = $("#StartDate")[0].value
+        var endDate = $("#EndDate")[0].value
+        var checkStartDate = isValidDate(startDate)
+        var checkEndDate = isValidDate(endDate)
+
+        if (Date.parse(startDate) > Date.parse(endDate)) {
+            alert("The start date must be less than the end date!");
+            return false;
+        }
+
+        if (checkStartDate == false || checkEndDate == false) {
+            alert("Must have a valid date!");
+            return false;
+        }
+
+        if (!name) {
+            alert("Name must have a value!");
+            return false;
+        }
+
+        $('#SearchTrigger').click();
+    }
+
+    function isValidDate(dateString) {
+        // First check for the pattern
+        if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(dateString))
+            return false;
+
+        // Parse the date parts to integers
+        var parts = dateString.split("/");
+        var day = parseInt(parts[1], 10);
+        var month = parseInt(parts[0], 10);
+        var year = parseInt(parts[2], 10);
+
+        // Check the ranges of month and year
+        if (year < 1000 || year > 3000 || month == 0 || month > 12)
+            return false;
+
+        var monthLength = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+        // Adjust for leap years
+        if (year % 400 == 0 || (year % 100 != 0 && year % 4 == 0))
+            monthLength[1] = 29;
+
+        // Check the range of the day
+        return day > 0 && day <= monthLength[month - 1];
+    };
+
+    function ExportBtnClick() {
+        var startDate = '@Model.StartDate'
+        var endDate = '@Model.EndDate'
+        var name = '@Model.Name'
+        var url = '@Url.Action("ExportBtnClick")'
+        location.href = url + "?selectedStartDate=" + startDate + "&selectedEndDate=" + endDate + "&selectedName=" + name
+    }
+
+</script>
+
+<h2>User Event History</h2>
+
+@using (Html.BeginForm("UserEventHistory", "User", FormMethod.Post, new { id = "SubmitForm" }))
+{
+    <fieldset style="border:solid 1px;">
+        <div style="padding-left:10px;padding-bottom:10px;">
+            <h4 style="text-decoration:underline;">Report Options</h4>
+            <table>
+                <tr>
+                    <td>
+                        <div>
+                            <label for="Name">Name (Last, First)</label>
+                        </div>
+                        <div>
+                            @Html.TextBoxFor(m => m.Name, new { style = "width:215px; " })
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        <label>Start Date</label>
+                    </td>
+                    <td>
+                        <label>End Date</label>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        @Html.TextBoxFor(m => m.StartDate, new { @type = "date" })
+                    </td>
+                    <td>
+                        @Html.TextBoxFor(m => m.EndDate, new { @type = "date" })
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding-right:10px; padding-top:25px;">
+                        <input type="button" id="SearchButton" name="SearchButton" value="Search" onclick=SearchBtnClick() />
+                        <input type="submit" id="SearchTrigger" name="SearchTrigger" hidden="hidden" />
+                    </td>
+                </tr>
+            </table>
+        </div>
+    </fieldset>
+}
+
+@if (Model.SearchStarted == true)
+{
+    <div><input type="button" value="Export" onclick=ExportBtnClick() style="margin-top:40px;" /></div>
+    <div>
+        <table id="ItemHistoryTable" style="width:100%; " >
+            <tr class="header" style="background-color:#F5F5F5; ">
+                <th>Event Date</th>
+                <th>Events</th>
+                <th>Before</th>
+                <th>After</th>
+                <th>Modified By</th>
+            </tr>
+
+            @foreach (var i in Model.reportEventItems)
+        {
+                <tr>
+                    <td>
+                        @i.ModifiedDate
+                    </td>
+                    <td>
+                        <content>
+                            <ul>
+                                @foreach (var itemEvents in i.Events)
+                                {
+                                    if (!string.IsNullOrEmpty(itemEvents))
+                                    {
+                                        if (!itemEvents.Contains("-"))
+                                        {
+                                            <li>@itemEvents</li>
+                                        }
+                                        else
+                                        {
+                                            <content>
+                                                <ul>
+                                                    <li>@itemEvents.Replace("-", "")</li>
+                                                </ul>
+                                            </content>
+                                        }
+                                    }
+                                }
+                            </ul>
+                        </content>
+                    </td>
+                    <td>
+                        <content>
+                            <ul>
+                                @foreach (var chBefore in i.ChangesBefore)
+                                {
+                                    if (!string.IsNullOrEmpty(chBefore))
+                                    {
+                                        if (!chBefore.Contains("-"))
+                                        {
+                                            <li>@chBefore</li>
+                                        }
+                                        else
+                                        {
+                                            <content>
+                                                <ul>
+                                                    <li>@chBefore.Replace("-", "").Replace("[", "")</li>
+                                                </ul>
+                                            </content>
+                                        }
+                                    }
+                                }
+                            </ul>
+                        </content>
+                    </td>
+                    <td>
+                        <content>
+                            <ul>
+                                @foreach (var chAfter in i.ChangesAfter)
+                                {
+                                    if (!string.IsNullOrEmpty(chAfter))
+                                    {
+                                        if (!chAfter.Contains("-"))
+                                        {
+                                            <li>@chAfter</li>
+                                        }
+                                        else if (chAfter.Contains("-="))
+                                        {
+                                            <content>
+                                                <ul>
+                                                    <content>
+                                                        <ul>
+                                                            <li>@chAfter.Replace("-=", "").Replace("[", "")</li>
+                                                        </ul>
+                                                    </content>
+                                                </ul>
+                                            </content>
+                                        }
+                                        else
+                                        {
+                                            <content>
+                                                <ul>
+                                                    <li>@chAfter.Replace("-", "").Replace("[", "")</li>
+                                                </ul>
+                                            </content>
+                                        }
+                                    }
+                                }
+                            </ul>
+                        </content>
+                    </td>
+                    <td>
+                        @i.ModifiedBy
+                    </td>
+                </tr>
+            }
+
+
+        </table>
+    </div>
+}
+
+<div style="padding-bottom:800px;"></div>

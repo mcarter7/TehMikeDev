@@ -1,0 +1,221 @@
+﻿@model IMarkReporting.Web.Models.Report.ItemsMarkedOverviewModel
+
+@{
+    ViewBag.Title = "ItemsOverview";
+}
+
+
+@using (Html.BeginForm("ItemsOverview", "MarkingReport", FormMethod.Post))
+{
+    
+    @Html.HiddenFor(m => m.ItemsMarkedCount, "Value")
+    @Html.HiddenFor(m => m.ItemsNotMarkedCount, "Value")
+    
+    <script type="text/javascript">
+
+        var markedCount = $('#ItemsMarkedCount').val();
+        var totalCount = $('#ItemsNotMarkedCount').val();
+
+    $(document).ready(function () {
+
+        //var oTable = $('#myDataTable').dataTable({
+        //    "paging": true,
+        //    "order": [[5, "desc"]],
+        //    "bPaginate": true,
+        //    "sAjaxSource": "BindMdssItemGrid",
+        //    "bProcessing": true,
+        //    "aoColumns": [
+        //                    { "mData": "Pkg_Id" },
+        //                    { "mData": "ITEM_ID" },
+        //                    { "mData": "Nsn" },
+        //                    { "mData": "Description" },
+        //                    { "mData": "SUPPLY_CLASS" },
+        //                    { "mData": "IsMarked" },
+        //                    { "mData": "CreatedDate"},
+        //                    {
+        //                        "mData": "ItemId",
+        //                        "sDefaultContent": "",
+        //                        "bSearchable": false,
+        //                        "sName": "View Item",
+        //                        "mRender": function( data, type, full ) {
+        //                            return "<a href='../Item/View?id="
+        //                                + data + "'>View</a>";
+        //                        }
+        //                    }
+        //    ],
+        //    "fnServerParams": function (aoData) {
+        //        aoData.push({ "name": "selectedPlanId", "value": $('#SelectedPlanId').val() });
+        //    }
+        //});
+
+    });
+
+    </script>
+
+    
+
+    <h2>ItemsOverview</h2>
+
+    <div class="row" style="margin-bottom: 20px; border-bottom: 1px solid blue">
+        <div class="col-lg-10">
+            <h2>Detailed MDSSII Progress Report</h2>
+        </div>
+        <div class="col-lg-2">
+
+        </div>
+    </div>
+
+    <div class="row" style="margin-top: 20px;">
+        <div class="col-md-6">
+            <div class="row">
+                <div class="col-md-3">
+                    <span style="font-size: 1.2em">Select Plan: </span>
+                </div>
+                <div class="col-xs-5" style="padding-top: 5px;">
+                    @*@Html.DropDownList("Plans", Model.MdssPlans)*@
+
+                    @Html.DropDownListFor(m => m.SelectedPlanId, Model.MdssPlans, new { @class = "form-control" })
+                    
+                    @*@Html.DropDownListFor(m=>m.SelectedPlan, new SelectList(Model.MdssPlans, "Name", "PlanId"))*@
+                    
+                </div>
+                <div class="col-md-3">
+                    @*<input type="hidden" id="dataTableFiltered">*@
+                    @Html.HiddenFor(m => m.SelectedPlanId, "Value")
+                    @*<button type="submit" id="ItemsOverview" name="ItemsOverview" value="ItemsOverview" class="btn btn-primary">Change Plan</button>*@                
+                </div>
+            </div>
+        </div>
+
+        @*<div class="col-md-7">
+            <div style="float: left;" id="donut_single"></div>
+            <div style="clear: both;" />
+        </div>*@
+
+
+    </div>
+
+
+    using (Ajax.BeginForm("DailyBreakdownByPerson",
+                        "MarkingReport",
+                        new AjaxOptions
+                        {
+                            InsertionMode = InsertionMode.Replace,
+                            UpdateTargetId = "WeekHours",
+                            HttpMethod = "Get"
+                        }))
+    {
+        <div class="row" style="margin-top: 25px;">
+            <div class="col-md-6">
+                @Html.Hidden("id", Model.PlanId)
+
+                <div class="col-md-3">Week</div>
+                <div class="col-md-5">
+                    @{
+                        var thisWeekDate = DateTime.UtcNow.Date.AddDays(-(int)DateTime.UtcNow.DayOfWeek);
+                        var list = new List<SelectListItem>();
+
+                        for (var idx = 0; idx < 52; idx++)
+                        {
+                            var weekDate = thisWeekDate.AddDays(-7 * idx);
+                            var li = new SelectListItem
+                            {
+                                Value = weekDate.ToShortDateString(),
+                                Text = weekDate.ToShortDateString()
+                            };
+
+                            list.Add(li);
+                        }
+                    }
+
+                    @*@Html.DropDownList("WeekDate", list)*@
+                    @Html.DropDownListFor(m => m.SelectedDate, list, new { @class = "form-control" })
+
+                </div>
+                <div class="col-md-3">
+                    <input type="submit" class="btn btn-primary" value="Update" />
+                </div>
+                <div style="clear: both;"></div>
+            </div>
+        </div>
+        <br/>
+
+        @Html.Hidden("id", Model.SelectedDate)
+        @Html.Hidden("planId", Model.PlanId)
+        <div id="WeekHours">
+            @Html.Action("DailyBreakdownByPersonHistory", "MarkingReport", new { planId = Model.PlanId, startDate = Model.SelectedDate })
+        </div>
+    }
+
+    @*<div class="row">
+        @Html.Action("DailyBreakdownByPerson", new { planId = Model.SelectedPlanId})
+
+    </div>*@
+
+    <div class="row">
+        @*<div class="col-md-2">
+        </div>*@
+
+        <div id="GridWrapper">
+
+            <div id="GridWrapper" class="row shadowRow">
+
+                @*@Html.Action("MarkedItemsGrid", new { planId = Model.SelectedPlanId })*@
+
+                @*@{Html.RenderPartial("_MarkedItemsGrid", Model.GridModel);}*@
+
+                @{Html.RenderPartial("_MarkedItemsGridAjax", Model.GridModel);}
+
+                @*@Html.Grid(Model.MdssReportItems).Columns(columns =>
+                {
+                    columns.Add(c => c.SerialNumber).Titled("Serial Number").Sortable(true).Filterable(true);
+                    columns.Add(c => c.Nsn).Titled("NSN").Sortable(true).Filterable(true);
+                    columns.Add(c => c.Description).Titled("Description").Filterable(true);
+                    columns.Add(c => c.Pkg_Id).Titled("Pkg_Id").Sortable(true).Filterable(true);
+                    columns.Add(c => c.SUPPLY_CLASS).Titled("Supply Class").Sortable(true).Filterable(true);
+                    //columns.Add(c => c.).Titled("Marker").Filterable(true);
+                    columns.Add(c => c.Location).Titled("Location").Sortable(true).Filterable(true);
+                    columns.Add(c => c.CreatedDate).Titled("Created Date").Sortable(true).Filterable(true);
+                    columns.Add(c => c.Qty).Titled("Qty").Sortable(true);
+                    columns.Add(c => c.UnitOfIssue).Titled("Unit Of Issue").Sortable(true).Filterable(true);
+                    columns.Add(c => c.ItemId).Titled("View").Sanitized(false).Encoded(false)
+                        .RenderValueAs(c => Html.ActionLink("View", "View", "Item", new {id = c.ItemId}, null).ToHtmlString());
+                }).WithPaging(20)*@
+            </div>
+        </div>
+
+        <div class="col-md-12">
+            @*<table id="myDataTable" class="display">
+                <thead>
+                    <tr>
+                        <th>PKG_ID</th>
+                        <th>ITEM_ID</th>
+                        <th>NSN</th>
+                        <th>Description</th>
+                        <th>SUPPLY_CLASS</th>
+                        <th>MARKED</th>
+                        <th>CreatedDate</th>
+                        <th>View</th>
+                        
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>*@
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-md-8"></div>
+        <div class="col-md-4"></div>
+    </div>
+
+}
+
+<script type="text/javascript">
+    //console.log("Items marked count: " + $('#ItemsMarkedCount').val());
+    //console.log("Items not marked count: " + $('#ItemsNotMarkedCount').val());
+
+    console.log("Items marked count; " + parseInt($('#ItemsMarkedCount').val(), 10));
+    console.log("Items not marked: " + parseInt($('#ItemsNotMarkedCount').val(), 10));
+</script>
+
